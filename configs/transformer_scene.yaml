@@ -1,0 +1,38 @@
+# Transformer (GPT) configuration for scene generation
+# Paper: GPT-2 medium, context=16384, trained on ASE + 3D-FRONT
+
+autoencoder:
+  base_ch: 32
+  n_down: 3
+  codebook_size: 4096
+  use_sh: false
+
+model:
+  size: "medium"       # GPT-2 medium: 24 layers, 16 heads, 1024 embd
+  context_len: 16384   # Sufficient for worst-case fully occupied chunk
+  # GPT-2 medium params: n_layer=24, n_head=16, n_embd=1024
+
+data:
+  data_dir: "data/scenes"
+  base_voxel_size: 0.025
+  chunk_size: [128, 128, 128]  # Base voxel chunk; GPT uses latent chunk = 16^3
+  min_occupancy_gpt: 0.3   # Coarser latent grid -> higher threshold
+
+training:
+  epochs: 100
+  batch_size: 64           # Effective batch size (paper: 64 with 4 GH200)
+  lr_scale: 1.0            # Scale for embedding/head learning rates
+  # Per-module LRs (Table 3 in paper):
+  # Output heads: AdamW, lr=0.004 * scale
+  # Embeddings: AdamW, lr=0.2 * scale
+  # Residual weights: AdamW, lr=0.005
+  # Input skip weights: AdamW, lr=0.5
+  # Others: Muon, lr=0.02
+  weight_decay: 0.025
+  muon_weight_decay: 0.025  # Decays linearly to 0
+
+inference:
+  temperature: 0.9
+  top_p: 0.9
+  # Resampling: retry empty columns up to 5 times
+  max_resample: 5

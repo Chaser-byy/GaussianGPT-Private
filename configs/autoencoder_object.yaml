@@ -1,0 +1,27 @@
+# Autoencoder configuration for object training (PhotoShape chairs)
+# Paper: 128^3 grid, 2 downsampling stages, first-order SH
+
+model:
+  base_ch: 32
+  n_down: 2          # 2 downsampling stages for objects
+  codebook_size: 4096
+  use_sh: true        # First-order spherical harmonics for objects
+
+data:
+  data_dir: "data/photoshape"
+  base_voxel_size: 0.0078125  # 1/128 of unit cube
+  chunk_size: [128, 128, 128]  # Full 128^3 base voxel grid; encoder->latent chunk=32^3
+  min_occupancy_ae: 0.05
+
+loss:
+  lambda_rgb: 12.5
+  lambda_perc: 0.1
+  lambda_occ: 1.0
+  lambda_lfq: 0.1
+  n_images: 4
+
+training:
+  epochs: 100
+  batch_size: 24
+  lr: 1.0e-4
+  lr_min_ratio: 0.1

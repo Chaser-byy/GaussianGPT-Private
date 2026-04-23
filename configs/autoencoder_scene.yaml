@@ -1,0 +1,27 @@
+# Autoencoder configuration for scene training
+# Paper: base voxel 2.5cm, 3 downsampling stages -> 20cm latent voxels
+
+model:
+  base_ch: 32
+  n_down: 3          # 3 downsampling stages: 2.5cm -> 5cm -> 10cm -> 20cm
+  codebook_size: 4096 # 2^12 = 4096 (12-bit LFQ)
+  use_sh: false       # No view-dependent appearance for scenes
+
+data:
+  data_dir: "data/scenes"
+  base_voxel_size: 0.025   # 2.5 cm
+  chunk_size: [128, 128, 128]  # Chunk in base voxels (128*0.025m=3.2m); encoder->latent chunk=16^3
+  min_occupancy_ae: 0.2     # Minimum occupancy for chunk sampling
+
+loss:
+  lambda_rgb: 7.5
+  lambda_perc: 0.3
+  lambda_occ: 1.0
+  lambda_lfq: 0.1
+  n_images: 12              # Number of images for re-rendering loss
+
+training:
+  epochs: 200
+  batch_size: 8             # Effective batch size (paper: 8 with 4 GPUs)
+  lr: 1.0e-4
+  lr_min_ratio: 0.1         # Cosine decay to 10% of initial lr

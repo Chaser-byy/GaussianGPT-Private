@@ -1,0 +1,29 @@
+# Transformer configuration for object generation (PhotoShape chairs)
+# Paper: GPT-2 small, context=8192
+
+autoencoder:
+  base_ch: 32
+  n_down: 2
+  codebook_size: 4096
+  use_sh: true
+
+model:
+  size: "small"        # GPT-2 small: 12 layers, 12 heads, 768 embd
+  context_len: 8192
+
+data:
+  data_dir: "data/photoshape"
+  base_voxel_size: 0.0078125
+  chunk_size: [128, 128, 128]  # Base voxel chunk; GPT uses latent chunk = 32^3
+  min_occupancy_gpt: 0.05
+
+training:
+  epochs: 100
+  batch_size: 64
+  lr_scale: 1.0        # For objects, LRs are exact (not divided by sqrt(1024/768))
+  weight_decay: 0.1    # Higher weight decay for objects
+
+inference:
+  temperature: 0.9
+  top_p: 0.9
+  max_resample: 5
