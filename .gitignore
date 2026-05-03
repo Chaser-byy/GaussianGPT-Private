@@ -37,3 +37,5 @@ runs/
 # === 操作系统生成文件 ===
 .DS_Store
 Thumbs.db
+
+/output/

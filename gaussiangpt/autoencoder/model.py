@@ -22,24 +22,32 @@ class GaussianAutoencoder(nn.Module):
     Paper config (scenes):
       - base voxel size: 2.5 cm, 3 downsampling stages -> 20 cm latent voxels
       - codebook_size: 4096 (12 bits LFQ)
-      - base_ch: 32, latent_ch: 12 (= num_bits for LFQ)
+      - base_ch: 128 (per L3DG Sec. 3.4: encoder stem -> 128 channels, then
+        each downsample doubles -> [128, 256, 512] for objects (n_down=2),
+        [128, 256, 512, 1024] for scenes (n_down=3)).
+      - latent_ch: 12 (= num_bits for LFQ)
     """
 
     def __init__(
         self,
-        base_ch: int = 32,
+        base_ch: int = 128,
         n_down: int = 3,
         codebook_size: int = 4096,
         use_sh: bool = False,
         encoder_expand: int = 16,
         decoder_hidden: int = 64,
+        voxel_size: float = 0.025,
     ):
         super().__init__()
         num_bits = int(math.log2(codebook_size))
         assert 2 ** num_bits == codebook_size, "codebook_size must be a power of 2"
 
-        # Gaussian attribute encoder/decoder heads
-        self.attr_encoder = GaussianAttributeEncoder(use_sh=use_sh, expand=encoder_expand)
+        # Gaussian attribute encoder/decoder heads. Both consume voxel_size
+        # so that input normalisation and the softplus-scale init bias stay
+        # consistent across the round-trip.
+        self.attr_encoder = GaussianAttributeEncoder(
+            use_sh=use_sh, expand=encoder_expand, voxel_size=voxel_size,
+        )
         in_ch = self.attr_encoder.out_dim
 
         # Sparse 3D CNN (latent_ch == num_bits for LFQ)
@@ -49,9 +57,16 @@ class GaussianAutoencoder(nn.Module):
         # LFQ quantizer
         self.quantizer = LookupFreeQuantizer(codebook_size=codebook_size)
         self.n_down = n_down
+        self.voxel_size = float(voxel_size)
 
-        # Gaussian attribute decoder
-        self.attr_decoder = GaussianAttributeDecoder(in_dim=in_ch, use_sh=use_sh, hidden=decoder_hidden)
+        # Gaussian attribute decoder. Per GaussianGPT Appendix C, offsets
+        # are predicted as unbounded world-space values (no offset_bound).
+        self.attr_decoder = GaussianAttributeDecoder(
+            in_dim=in_ch,
+            use_sh=use_sh,
+            hidden=decoder_hidden,
+            voxel_size=voxel_size,
+        )
 
     def _make_sparse_tensor(self, voxel_features: torch.Tensor, voxel_coords: torch.Tensor):
         """Wrap dense features + coords into a MinkowskiEngine SparseTensor.

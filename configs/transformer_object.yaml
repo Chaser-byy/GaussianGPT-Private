@@ -2,7 +2,7 @@
 # Paper: GPT-2 small, context=8192
 
 autoencoder:
-  base_ch: 32
+  base_ch: 128
   n_down: 2
   codebook_size: 4096
   use_sh: true

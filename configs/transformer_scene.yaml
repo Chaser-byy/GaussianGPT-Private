@@ -2,7 +2,7 @@
 # Paper: GPT-2 medium, context=16384, trained on ASE + 3D-FRONT
 
 autoencoder:
-  base_ch: 32
+  base_ch: 128
   n_down: 3
   codebook_size: 4096
   use_sh: false

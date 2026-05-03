@@ -1,29 +1,50 @@
-# Autoencoder configuration for scene training
+# Autoencoder configuration for scene training (L3DG-style; rooms).
 # Paper: base voxel 2.5cm, 3 downsampling stages -> 20cm latent voxels
 
 model:
-  base_ch: 32
-  n_down: 3          # 3 downsampling stages: 2.5cm -> 5cm -> 10cm -> 20cm
-  codebook_size: 4096 # 2^12 = 4096 (12-bit LFQ)
-  use_sh: false       # No view-dependent appearance for scenes
+  base_ch: 128           # Per L3DG Sec. 3.4 doubling rule: [128, 256, 512, 1024]
+                         # (bottleneck 1024 because GaussianGPT scene cfg uses n_down=3)
+  n_down: 3              # 3 downsampling stages: 2.5cm -> 5cm -> 10cm -> 20cm
+  codebook_size: 4096    # 2^12 = 4096 (12-bit LFQ)
+  use_sh: false          # No view-dependent appearance for scenes
+  # Note: GaussianGPT Appendix C predicts offsets as unbounded world-space
+  # values (no L3DG-style tanh clamping), and scales via softplus.
 
 data:
   data_dir: "/home/chengtianle/GaussianGPT/data/overfit"
-  base_voxel_size: 0.025   # 2.5 cm
-  chunk_size: [256, 256, 256]  # Chunk in base voxels (128*0.025m=3.2m); encoder->latent chunk=16^3
-  min_occupancy_ae: 0.2     # Minimum occupancy for chunk sampling
+  base_voxel_size: 0.025          # 2.5 cm
+  chunk_size: [256, 256, 256]     # base voxels; latent chunk = 32^3 (transformer seq ~ 32k)
+  min_occupancy_ae: 0.2
 
+# GaussianGPT Eq. (1):
+#   L = lambda_rgb  * L1(renderings)            # L3DG L_RGB
+#     + lambda_perc * VGG19(renderings)         # L3DG L_perc
+#     + lambda_occ  * BCE(occupancy)            # L3DG L_occ
+#     + lambda_lfq  * softplus(L_LFQ + 5)       # LFQ codebook entropy
 loss:
-  lambda_rgb: 7.5
-  lambda_perc: 0.3
+  lambda_rgb: 7.5           # GaussianGPT Sec. 4.2 room hyperparam
+  lambda_perc: 0.3          # GaussianGPT Sec. 4.2 room hyperparam
   lambda_occ: 1.0
   lambda_lfq: 0.1
-  n_images: 12              # Number of images for re-rendering loss
+  n_images: 12              # M = 12 random viewpoints per scene per step (L3DG room)
+  render_size: 128          # square image side; lower for speed if VRAM bound
+  vgg19_weights_path: "/home/chengtianle/GaussianGPT/checkpoints/vgg19-dcbb9e9d.pth"
+  fov_deg: 60.0             # camera horizontal/vertical FOV
+  radius_factor: 1.5        # camera distance = 1.5 · half-bbox-diagonal
+  upper_hemisphere_only: false
+  camera_jitter: 0.05       # small unit-vector perturbation on each spherical sample
 
 training:
   epochs: 5000
-  batch_size: 4             # Effective batch size (paper: 8 with 4 GPUs)
+  batch_size: 4             # paper: effective 8 with 4 GPUs
   lr: 1.0e-4
-  lr_min_ratio: 0.1         # Cosine decay to 10% of initial lr
+  lr_min_ratio: 0.1         # cosine decay floor
   save_every: 1000
-  val_every_steps: 4000        # Run validation every N optimizer steps; 0 disables
+  val_every_steps: 4000     # 0 disables in-training validation
+
+# Optional sanity checks logged during training. The colour-clamp check
+# detects the dead-gradient pathology of `clamp(0,1)` on the colour head:
+# rising `frac_dead` or shrinking `gnorm(color/scale)` ratio = trouble.
+# Set color_check_every to 0 to disable.
+diagnostics:
+  color_check_every: 200    # global-steps between diagnostic prints

@@ -1,27 +1,43 @@
-# Autoencoder configuration for object training (PhotoShape chairs)
-# Paper: 128^3 grid, 2 downsampling stages, first-order SH
+# Autoencoder configuration for object training (L3DG-style; PhotoShape chairs).
+# Paper: 128^3 grid, 2 downsampling stages, first-order SH.
 
 model:
-  base_ch: 32
-  n_down: 2          # 2 downsampling stages for objects
+  base_ch: 128           # Per L3DG Sec. 3.4: stem 128 -> 256 -> 512 (bottleneck)
+  n_down: 2              # 2 downsampling stages for objects
   codebook_size: 4096
-  use_sh: true        # First-order spherical harmonics for objects
+  use_sh: true           # First-order spherical harmonics for objects
+  # Note: GaussianGPT Appendix C predicts offsets as unbounded world-space
+  # values (no L3DG-style tanh clamping), and scales via softplus.
 
 data:
   data_dir: "data/photoshape"
-  base_voxel_size: 0.0078125  # 1/128 of unit cube
-  chunk_size: [128, 128, 128]  # Full 128^3 base voxel grid; encoder->latent chunk=32^3
+  base_voxel_size: 0.0078125     # 1/128 of unit cube
+  chunk_size: [128, 128, 128]    # full 128^3 grid; latent chunk = 32^3
   min_occupancy_ae: 0.05
 
+# See scenes config for the loss formulation.
 loss:
-  lambda_rgb: 12.5
-  lambda_perc: 0.1
+  lambda_rgb: 12.5          # GaussianGPT Sec. 4.2 object hyperparam
+  lambda_perc: 0.1          # GaussianGPT Sec. 4.2 object hyperparam
   lambda_occ: 1.0
   lambda_lfq: 0.1
-  n_images: 4
+  n_images: 4               # M = 4 viewpoints per object per step (L3DG object)
+  render_size: 128
+  vgg19_weights_path: "/home/chengtianle/GaussianGPT/checkpoints/vgg19-dcbb9e9d.pth"
+  fov_deg: 50.0             # objects in unit cube; tighter FOV than rooms
+  radius_factor: 1.6
+  upper_hemisphere_only: true
+  camera_jitter: 0.05
 
 training:
   epochs: 100
   batch_size: 24
   lr: 1.0e-4
   lr_min_ratio: 0.1
+  save_every: 50
+  val_every_steps: 0
+
+# Optional sanity checks logged during training. See scene config for
+# details of the colour-clamp dead-gradient diagnostic.
+diagnostics:
+  color_check_every: 200

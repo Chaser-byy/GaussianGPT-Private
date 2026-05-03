@@ -63,18 +63,36 @@ class LookupFreeQuantizer(nn.Module):
         bits = (indices.unsqueeze(-1) & self.bit_masks) > 0  # (..., num_bits)
         return bits.float() * 2 - 1  # map {0,1} -> {-1,+1}
 
-    def entropy_loss(self, z: torch.Tensor) -> torch.Tensor:
-        """Entropy loss to encourage uniform codebook usage.
+    def entropy_loss(self, z: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+        """LFQ entropy loss in the Magvit-v2 form.
 
-        Maximizes entropy of the per-bit marginal distributions.
-        L_LFQ = -H(bits) = sum_i [p_i * log(p_i) + (1-p_i) * log(1-p_i)]
+        L_LFQ = E_x[H(p_x)] - H(E_x[p_x])
+              = (mean per-sample bit entropy)  -  (marginal bit entropy)
+
+        Minimising the first term pushes each sample's per-bit probability
+        towards 0 or 1 (i.e. the encoder commits confidently to a code),
+        while maximising the second term keeps the marginal usage close to
+        50/50 per bit, encouraging full codebook coverage.
+
+        The previous implementation only used `-mean(H(p))`, which actually
+        drives p -> 0.5 for every sample (i.e. the encoder output collapses
+        to ~0 and quantisation becomes random).
         """
-        # Per-bit probability of being +1
-        p = torch.sigmoid(z)  # soft approximation
-        # Binary entropy per bit, averaged
+        # Sharper sigmoid so gradients reflect quantisation by sign.
+        p = torch.sigmoid(z * (2.0 / max(temperature, 1e-6)))  # (..., num_bits)
         eps = 1e-6
-        entropy = -(p * (p + eps).log() + (1 - p) * (1 - p + eps).log())
-        return -entropy.mean()  # negative because we want to maximize entropy
+
+        # Per-sample binary entropy of each bit, averaged over samples.
+        H_per = -(p * (p + eps).log() + (1.0 - p) * (1.0 - p + eps).log())
+        per_sample_term = H_per.mean()
+
+        # Marginal entropy of each bit across the batch (flatten leading dims).
+        p_marginal = p.reshape(-1, p.shape[-1]).mean(dim=0)  # (num_bits,)
+        H_marg = -(p_marginal * (p_marginal + eps).log() +
+                   (1.0 - p_marginal) * (1.0 - p_marginal + eps).log())
+        marginal_term = H_marg.mean()
+
+        return per_sample_term - marginal_term
 
     def forward(self, z: torch.Tensor):
         z_q, indices = self.encode(z)

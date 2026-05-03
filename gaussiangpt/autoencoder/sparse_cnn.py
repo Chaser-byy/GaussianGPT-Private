@@ -59,7 +59,7 @@ if HAS_MINKOWSKI:
             return x, self.occ_head(x)
 
     class SparseEncoder(nn.Module):
-        def __init__(self, in_ch: int, base_ch: int = 32, latent_ch: int = 12, n_down: int = 3):
+        def __init__(self, in_ch: int, base_ch: int = 128, latent_ch: int = 12, n_down: int = 3):
             super().__init__()
             self.stem = ME.MinkowskiConvolution(in_ch, base_ch, kernel_size=3, stride=1, dimension=3)
             self.stem_bn = ME.MinkowskiBatchNorm(base_ch)
@@ -75,7 +75,7 @@ if HAS_MINKOWSKI:
             return self.proj(x)
 
     class SparseDecoder(nn.Module):
-        def __init__(self, latent_ch: int, base_ch: int = 32, out_ch: Optional[int] = None, n_up: int = 3):
+        def __init__(self, latent_ch: int, base_ch: int = 128, out_ch: Optional[int] = None, n_up: int = 3):
             super().__init__()
             chs = list(reversed([base_ch * (2 ** i) for i in range(n_up + 1)]))
             self.proj = ME.MinkowskiConvolution(latent_ch, chs[0], kernel_size=1, stride=1, dimension=3)
@@ -105,7 +105,7 @@ else:
             return self.relu(self.net(x) + x)
 
     class SparseEncoder(nn.Module):
-        def __init__(self, in_ch: int, base_ch: int = 32, latent_ch: int = 12, n_down: int = 3):
+        def __init__(self, in_ch: int, base_ch: int = 128, latent_ch: int = 12, n_down: int = 3):
             super().__init__()
             chs = [base_ch * (2 ** i) for i in range(n_down + 1)]
             layers: List[nn.Module] = [
@@ -124,7 +124,7 @@ else:
             return self.net(x)
 
     class SparseDecoder(nn.Module):
-        def __init__(self, latent_ch: int, base_ch: int = 32, out_ch: Optional[int] = None, n_up: int = 3):
+        def __init__(self, latent_ch: int, base_ch: int = 128, out_ch: Optional[int] = None, n_up: int = 3):
             super().__init__()
             chs = list(reversed([base_ch * (2 ** i) for i in range(n_up + 1)]))
             self.proj = nn.Conv3d(latent_ch, chs[0], 1)

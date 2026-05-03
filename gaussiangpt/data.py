@@ -100,7 +100,16 @@ class GaussianSceneDataset(Dataset):
         voxel_coords, voxel_gaussians = self._voxelize(gaussians)   #每个 occupied voxel 的全局整数坐标。每个 occupied voxel 对应随机/确定性选出的一个 Gaussian 属性。
 
         # Sample a chunk and apply the same mask to the aligned Gaussian attributes.
-        chunk_result = self.chunk_sampler.sample_chunk(voxel_coords, voxel_gaussians)
+        # In val/test mode we want validation reconstructions to be exactly
+        # comparable across runs and across training steps, so seed the
+        # chunk-sampling RNG deterministically by (split, scene_idx, aug_idx).
+        # This was previously random even with augment=False.
+        if self.split != "train":
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(hash(("ae_val_chunk", scene_idx, aug_idx)) & 0x7FFFFFFF)
+                chunk_result = self.chunk_sampler.sample_chunk(voxel_coords, voxel_gaussians)
+        else:
+            chunk_result = self.chunk_sampler.sample_chunk(voxel_coords, voxel_gaussians)
         if chunk_result is None:
             # Fallback: return empty chunk
             return self.__getitem__((idx + 1) % len(self))
@@ -150,7 +159,14 @@ class GaussianSceneDataset(Dataset):
         positions = tensor_from_props(["x", "y", "z"])
         opacities = tensor_from_props(["opacity"])
         scales = torch.exp(tensor_from_props(self._sorted_prefixed_props(vertex_data, "scale_")))
-        rotations = tensor_from_props(self._sorted_prefixed_props(vertex_data, "rot_"))
+        # 3DGS PLYs store quaternions un-normalised (the renderer normalises
+        # at use time). The autoencoder decoder predicts unit quaternions,
+        # so normalise the targets here once for a fair L1/MSE comparison.
+        # 由于 gaussian_heads.py:195 也进行了归一化，所以这里这个归一化功能上是冗余的，但留着更鲁棒
+        rotations = F.normalize(
+            tensor_from_props(self._sorted_prefixed_props(vertex_data, "rot_")),
+            dim=-1,
+        )
 
         C0 = 0.28209479177387814  # SH degree-0 normalization constant.
         f_dc_names = [f"f_dc_{i}" for i in range(3)]
