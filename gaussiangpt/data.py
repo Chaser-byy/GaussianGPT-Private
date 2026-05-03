@@ -19,6 +19,7 @@ Data format expected:
 """
 import os
 import math
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
@@ -34,6 +35,7 @@ class GaussianSceneDataset(Dataset):
     Voxelizes Gaussians at base_voxel_size and returns chunks.
     Applies 8x augmentation via rotations (0/90/180/270) and reflections.
     """
+    SCENE_EXTENSIONS = (".pt", ".pth", ".ply")
 
     def __init__(
         self,
@@ -45,9 +47,11 @@ class GaussianSceneDataset(Dataset):
         augment: bool = True,
         split: str = "train",
         split_ratio: float = 0.9,
-    ):
+    ):  
+        data_dir = data_dir + "/" + split
         super().__init__()
         self.data_dir = data_dir
+        self.split = split
         self.base_voxel_size = base_voxel_size
         self.latent_voxel_size = base_voxel_size * (2 ** n_down)
         self.chunk_size = chunk_size
@@ -55,16 +59,16 @@ class GaussianSceneDataset(Dataset):
         self.chunk_sampler = ChunkSampler(chunk_size, min_occupancy=min_occupancy)
 
         # Find all scene files
-        all_files = sorted([
+        self.files = sorted([
             os.path.join(data_dir, f)
             for f in os.listdir(data_dir)
-            if f.endswith(".pt") or f.endswith(".pth")
+            if f.lower().endswith(self.SCENE_EXTENSIONS)
         ])
-        n_train = int(len(all_files) * split_ratio)
-        if split == "train":
-            self.files = all_files[:n_train]
-        else:
-            self.files = all_files[n_train:]
+        # n_train = int(len(all_files) * split_ratio)
+        # if split == "train":
+        #     self.files = all_files[:n_train]
+        # else:
+        #     self.files = all_files[n_train:]
 
         # 8x augmentation: 4 rotations x 2 reflections
         self.aug_factor = 8 if augment else 1
@@ -77,7 +81,7 @@ class GaussianSceneDataset(Dataset):
         scene_idx = idx % self.n_scenes
         aug_idx = idx // self.n_scenes if self.augment else 0
 
-        data = torch.load(self.files[scene_idx], map_location="cpu")
+        data = self._load_scene_file(self.files[scene_idx])
         gaussians = {
             "offset": data["positions"],
             "scale": data["scales"],
@@ -92,19 +96,16 @@ class GaussianSceneDataset(Dataset):
         if self.augment:
             gaussians = self._augment(gaussians, aug_idx)
 
-        # Voxelize at latent resolution
-        voxel_coords, voxel_gaussians = self._voxelize(gaussians)
+        # Voxelize at base resolution.
+        voxel_coords, voxel_gaussians = self._voxelize(gaussians)   #每个 occupied voxel 的全局整数坐标。每个 occupied voxel 对应随机/确定性选出的一个 Gaussian 属性。
 
-        # Sample a chunk
-        chunk_result = self.chunk_sampler.sample_chunk(voxel_coords)
+        # Sample a chunk and apply the same mask to the aligned Gaussian attributes.
+        chunk_result = self.chunk_sampler.sample_chunk(voxel_coords, voxel_gaussians)
         if chunk_result is None:
             # Fallback: return empty chunk
             return self.__getitem__((idx + 1) % len(self))
 
-        chunk_coords, chunk_origin = chunk_result
-
-        # Get Gaussians in this chunk
-        flat_in_chunk = self._get_chunk_gaussians(voxel_coords, chunk_coords, chunk_origin, voxel_gaussians)
+        chunk_coords, chunk_origin, flat_in_chunk = chunk_result
 
         result = {
             "voxel_coords": chunk_coords,
@@ -117,6 +118,141 @@ class GaussianSceneDataset(Dataset):
             result["cameras"] = data["cameras"]
 
         return result
+
+    def _load_scene_file(self, path: str) -> Dict:
+        """Load either a tensor checkpoint scene or a standard 3DGS PLY scene."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".pt", ".pth"):
+            return torch.load(path, map_location="cpu")
+        if ext == ".ply":
+            return self._load_ply_scene(path)
+        raise ValueError(f"Unsupported scene file extension: {path}")
+
+    def _load_ply_scene(self, path: str) -> Dict[str, torch.Tensor]:
+        """Parse a 3D Gaussian Splatting .ply file into the tensor scene format."""
+        vertex_count, properties, fmt, header_end, header_lines = self._read_ply_header(path)
+        if vertex_count <= 0:
+            raise ValueError(f"PLY file has no vertex data: {path}")
+
+        dtype = self._ply_dtype(properties, fmt)
+        if fmt == "ascii":
+            vertex_data = np.loadtxt(path, dtype=dtype, skiprows=header_lines, max_rows=vertex_count)
+        else:
+            vertex_data = np.fromfile(path, dtype=dtype, count=vertex_count, offset=header_end)
+
+        def tensor_from_props(names: List[str]) -> torch.Tensor:
+            missing = [name for name in names if name not in vertex_data.dtype.names]
+            if missing:
+                raise KeyError(f"Missing PLY properties {missing} in {path}")
+            arr = np.stack([vertex_data[name] for name in names], axis=1).astype(np.float32, copy=False)
+            return torch.from_numpy(arr.copy())
+
+        positions = tensor_from_props(["x", "y", "z"])
+        opacities = tensor_from_props(["opacity"])
+        scales = torch.exp(tensor_from_props(self._sorted_prefixed_props(vertex_data, "scale_")))
+        rotations = tensor_from_props(self._sorted_prefixed_props(vertex_data, "rot_"))
+
+        C0 = 0.28209479177387814  # SH degree-0 normalization constant.
+        f_dc_names = [f"f_dc_{i}" for i in range(3)]
+        if all(name in vertex_data.dtype.names for name in f_dc_names):
+            f_dc = tensor_from_props(f_dc_names)
+            colors = (f_dc * C0 + 0.5).clamp(0, 1)
+        elif all(name in vertex_data.dtype.names for name in ("red", "green", "blue")):
+            colors = tensor_from_props(["red", "green", "blue"]) / 255.0
+        else:
+            raise KeyError(f"PLY file needs either f_dc_* or red/green/blue color properties: {path}")
+
+        data = {
+            "positions": positions,
+            "scales": scales,
+            "opacities": opacities,
+            "rotations": rotations,
+            "colors": colors,
+        }
+
+        f_rest_names = self._sorted_prefixed_props(vertex_data, "f_rest_")
+        if all(name in vertex_data.dtype.names for name in f_dc_names) and len(f_rest_names) >= 9:
+            f_rest = tensor_from_props(f_rest_names[:9])
+            data["sh"] = torch.cat([tensor_from_props(f_dc_names), f_rest], dim=1)
+
+        return data
+
+    def _read_ply_header(self, path: str) -> Tuple[int, List[Tuple[str, str]], str, int, int]:
+        vertex_count = 0
+        properties = []
+        fmt = None
+        in_vertex = False
+        header_lines = 0
+
+        with open(path, "rb") as f:
+            first_line = f.readline()
+            header_lines += 1
+            if first_line.strip() != b"ply":
+                raise ValueError(f"Not a PLY file: {path}")
+
+            while True:
+                line_bytes = f.readline()
+                if not line_bytes:
+                    raise ValueError(f"PLY header missing end_header: {path}")
+                header_lines += 1
+                line = line_bytes.decode("ascii").strip()
+                parts = line.split()
+
+                if not parts or parts[0] == "comment":
+                    continue
+                if parts[0] == "format":
+                    fmt = parts[1]
+                elif parts[0] == "element":
+                    in_vertex = parts[1] == "vertex"
+                    if in_vertex:
+                        vertex_count = int(parts[2])
+                elif parts[0] == "property" and in_vertex:
+                    if parts[1] == "list":
+                        raise ValueError(f"List properties are not supported for vertex data in {path}")
+                    properties.append((parts[2], parts[1]))
+                elif parts[0] == "end_header":
+                    break
+
+            header_end = f.tell()
+
+        if fmt not in ("ascii", "binary_little_endian", "binary_big_endian"):
+            raise ValueError(f"Unsupported PLY format {fmt!r} in {path}")
+        if not properties:
+            raise ValueError(f"PLY file has no vertex properties: {path}")
+
+        return vertex_count, properties, fmt, header_end, header_lines
+
+    def _ply_dtype(self, properties: List[Tuple[str, str]], fmt: str) -> np.dtype:
+        endian = "<" if fmt == "binary_little_endian" else ">" if fmt == "binary_big_endian" else "="
+        type_map = {
+            "char": "i1",
+            "int8": "i1",
+            "uchar": "u1",
+            "uint8": "u1",
+            "short": "i2",
+            "int16": "i2",
+            "ushort": "u2",
+            "uint16": "u2",
+            "int": "i4",
+            "int32": "i4",
+            "uint": "u4",
+            "uint32": "u4",
+            "float": "f4",
+            "float32": "f4",
+            "double": "f8",
+            "float64": "f8",
+        }
+        fields = []
+        for name, ply_type in properties:
+            if ply_type not in type_map:
+                raise ValueError(f"Unsupported PLY property type {ply_type!r}")
+            np_type = type_map[ply_type]
+            fields.append((name, np_type if np_type.endswith("1") else endian + np_type))
+        return np.dtype(fields)
+
+    def _sorted_prefixed_props(self, vertex_data: np.ndarray, prefix: str) -> List[str]:
+        names = [name for name in vertex_data.dtype.names if name.startswith(prefix)]
+        return sorted(names, key=lambda name: int(name[len(prefix):]))
 
     def _augment(self, gaussians: Dict, aug_idx: int) -> Dict:
         """Apply rotation/reflection augmentation in the horizontal plane."""
@@ -171,51 +307,32 @@ class GaussianSceneDataset(Dataset):
         """Assign Gaussians to voxels at base voxel resolution.
 
         Returns voxel coordinates and per-voxel Gaussian attributes
-        (one Gaussian per voxel — first occurrence kept).
+        (one Gaussian per voxel, randomly sampled for training).
         """
         positions = gaussians["offset"]
         voxel_coords = torch.floor(positions / self.base_voxel_size).long()
 
-        # Deduplicate: keep first occurrence per voxel.
-        unique_coords, inverse = torch.unique(voxel_coords, dim=0, return_inverse=True)
+        if self.split == "train":
+            # Random permutation makes the first occurrence per voxel a random Gaussian.
+            perm = torch.randperm(len(positions), device=positions.device)
+        else:
+            # Keep validation/test deterministic.
+            perm = torch.arange(len(positions), device=positions.device)
+
+        permuted_coords = voxel_coords[perm]
+        unique_coords, inverse = torch.unique(permuted_coords, dim=0, return_inverse=True)
         n_voxels = unique_coords.shape[0]
 
-        # Vectorized first-occurrence: scatter source indices into first_occ.
-        # scatter_ with reduce='amin' picks the minimum (= first) source index per voxel.
-        src = torch.arange(len(positions), dtype=torch.long)
-        first_occ = torch.full((n_voxels,), len(positions), dtype=torch.long)
+        # Vectorized first occurrence in the permuted order.
+        src = torch.arange(len(positions), dtype=torch.long, device=positions.device)
+        first_occ = torch.full((n_voxels,), len(positions), dtype=torch.long, device=positions.device)
         first_occ.scatter_reduce_(0, inverse, src, reduce="amin", include_self=True)
+        selected_idx = perm[first_occ]
 
-        voxel_gaussians = {key: val[first_occ] for key, val in gaussians.items()}
+        voxel_gaussians = {key: val[selected_idx] for key, val in gaussians.items()}
+        voxel_centers = (unique_coords.to(positions.dtype) + 0.5) * self.base_voxel_size
+        voxel_gaussians["offset"] = positions[selected_idx] - voxel_centers
         return unique_coords, voxel_gaussians
-
-    def _get_chunk_gaussians(
-        self,
-        voxel_coords: torch.Tensor,
-        chunk_coords: torch.Tensor,
-        chunk_origin: torch.Tensor,
-        voxel_gaussians: Dict,
-    ) -> Dict:
-        """Extract Gaussians for voxels in the chunk.
-
-        chunk_coords: (M, 3) relative coords within chunk (0..chunk_size-1)
-        chunk_origin: (3,) global offset of chunk
-        voxel_coords: (N, 3) global voxel coordinates
-        """
-        abs_chunk_coords = chunk_coords + chunk_origin  # (M, 3) global coords in chunk
-
-        # Build a set of chunk coord tuples for O(N) lookup
-        chunk_set = set(map(tuple, abs_chunk_coords.tolist()))
-
-        # Find which global voxels fall inside the chunk
-        global_idx = [
-            i for i, c in enumerate(voxel_coords.tolist())
-            if tuple(c) in chunk_set
-        ]
-        global_idx = torch.tensor(global_idx, dtype=torch.long)
-
-        return {key: val[global_idx] for key, val in voxel_gaussians.items()}
-
 
 class TokenizedSceneDataset(Dataset):
     """Dataset that tokenizes scenes using a trained autoencoder.
@@ -333,16 +450,17 @@ class PhotoShapeDataset(Dataset):
         split_ratio: float = 0.9,
     ):
         super().__init__()
+        data_dir = data_dir + "/" + split
         self.data_dir = data_dir
         self.grid_size = grid_size
 
-        all_files = sorted([
+        self.files = sorted([
             os.path.join(data_dir, f)
             for f in os.listdir(data_dir)
             if f.endswith(".pt") or f.endswith(".pth")
         ])
-        n_train = int(len(all_files) * split_ratio)
-        self.files = all_files[:n_train] if split == "train" else all_files[n_train:]
+        # n_train = int(len(all_files) * split_ratio)
+        # self.files = all_files[:n_train] if split == "train" else all_files[n_train:]
 
     def __len__(self) -> int:
         return len(self.files)

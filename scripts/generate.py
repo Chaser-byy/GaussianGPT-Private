@@ -58,8 +58,8 @@ def load_models(args):
         n_down=args.ae_n_down,
         codebook_size=args.codebook_size,
     ).to(device)
-    ae_ckpt = torch.load(args.ae_checkpoint, map_location=device)
-    ae.load_state_dict(ae_ckpt["model"] if "model" in ae_ckpt else ae_ckpt)
+    # ae_ckpt = torch.load(args.ae_checkpoint, map_location=device)
+    # ae.load_state_dict(ae_ckpt["model"] if "model" in ae_ckpt else ae_ckpt)
     ae.eval()
 
     # GPT — chunk_size from args is in base voxels; latent chunk = chunk_size / 2^n_down
@@ -71,8 +71,8 @@ def load_models(args):
         chunk_size=latent_chunk_size,
         codebook_size=args.codebook_size,
     ).to(device)
-    gpt_ckpt = torch.load(args.gpt_checkpoint, map_location=device)
-    gpt.load_state_dict(gpt_ckpt["model"] if "model" in gpt_ckpt else gpt_ckpt)
+    # gpt_ckpt = torch.load(args.gpt_checkpoint, map_location=device)
+    # gpt.load_state_dict(gpt_ckpt["model"] if "model" in gpt_ckpt else gpt_ckpt)
     gpt.eval()
 
     return ae, gpt, device
@@ -104,27 +104,23 @@ def decode_tokens_to_gaussians(ae, gpt, tokens, coords, token_type, device):
         import MinkowskiEngine as ME
         batch_idx = torch.zeros(len(voxel_coords), 1, dtype=torch.int, device=device)
         coords_me = torch.cat([batch_idx, voxel_coords.to(device)], dim=1)
-        sparse_input = ME.SparseTensor(features=z_q, coordinates=coords_me)
+        latent_stride = 2**ae.n_down   # 8 = 2 ** 3暂时写死, 后面可以改
+        sparse_input = ME.SparseTensor(features=z_q, coordinates=coords_me, tensor_stride=latent_stride)
         decoded, _ = ae.decoder(sparse_input)
         feat = decoded.F
+        voxel_coords = decoded.C[:, 1:]
     else:
-        # Dense fallback: place latent features in latent-size grid, decode to base resolution
-        cx, cy, cz = chunk_size_t
-        grid = torch.zeros(1, z_q.shape[-1], cx, cy, cz, device=device)
-        vc = voxel_coords.to(device)
-        grid[0, :, vc[:, 0], vc[:, 1], vc[:, 2]] = z_q.T
-        decoded, _ = ae.decoder(grid)
-        # decoded is at base voxel resolution; sample at voxel center positions
-        # Each latent voxel maps to a 2^n_down block; use center of each block
-        n_down = ae.encoder.downs.__len__() if hasattr(ae.encoder, 'downs') else 3
-        scale = 2 ** n_down
-        # Map latent coords to base voxel coords (center of each block)
-        vc_base = vc * scale + scale // 2
-        vc_base = vc_base.clamp(0, decoded.shape[2] - 1)
-        feat = decoded[0, :, vc_base[:, 0], vc_base[:, 1], vc_base[:, 2]].T
+        assert False, "Dense fallback not implemented"
 
     gaussians = ae.attr_decoder(feat)
     gaussians["voxel_coords"] = voxel_coords
+    # Convert offset (relative to voxel center) to absolute world-space positions.
+    # Each latent voxel covers a block of size 2^n_down base voxels; the voxel
+    # center in base-voxel units is (coord + 0.5) * voxel_size.
+    n_down = ae.encoder.downs.__len__() if hasattr(ae.encoder, 'downs') else 3
+    voxel_size = float(2 ** n_down)  # base voxels per latent voxel
+    vc_world = (voxel_coords.float().to(device) + 0.5) * voxel_size  # (N, 3)
+    gaussians["position"] = vc_world + gaussians["offset"]  # absolute world coords
     return gaussians
 
 
@@ -260,6 +256,96 @@ def main():
     # Save results
     torch.save(results, args.output)
     print(f"Saved {len(results)} generated scene(s) to {args.output}")
+
+    # Also export as standard 3DGS .ply (one file per sample)
+    base, ext = os.path.splitext(args.output)
+    for idx, item in enumerate(results):
+        # outpainting returns (gaussians, offset) tuples; others return plain dicts
+        if isinstance(item, tuple):
+            g, chunk_offset = item
+            # shift positions by chunk offset (in base-voxel units)
+            n_down = args.ae_n_down
+            voxel_size = float(2 ** n_down)
+            g = dict(g)
+            if "position" in g:
+                g["position"] = g["position"] + chunk_offset.float().to(g["position"].device) * voxel_size
+        else:
+            g = item
+
+        ply_path = f"{base}_{idx}.ply" if len(results) > 1 else f"{base}.ply"
+        _save_3dgs_ply(g, ply_path)
+        print(f"  -> 3DGS ply: {ply_path}")
+
+
+def _save_3dgs_ply(gaussians: dict, path: str):
+    """Export Gaussians to standard 3DGS .ply format.
+
+    Handles two cases automatically:
+      - Scene model (use_sh=False): 'color' RGB -> converted to SH DC term, f_rest zeros
+      - Object model (use_sh=True): 'sh' (12-dim, degree-1) -> f_dc + f_rest, remaining zeros
+    """
+    pos = gaussians["position"].cpu().float()   # (N, 3)
+    N = pos.shape[0]
+
+    C0 = 0.28209479177387814  # 1 / (2 * sqrt(pi))
+
+    if "sh" in gaussians:
+        # Object model: sh is (N, 12) = 4 coefficients * 3 channels (degree-1 SH)
+        # Layout: [c0_r, c0_g, c0_b, c1_r, c1_g, c1_b, c2_r, c2_g, c2_b, c3_r, c3_g, c3_b]
+        sh = gaussians["sh"].cpu().float()  # (N, 12)
+        f_dc = sh[:, :3]                    # degree-0 coefficients, already in SH space
+        f_rest_deg1 = sh[:, 3:]             # degree-1 coefficients (9 dims)
+        # Pad to standard 45 f_rest (degree 1-3); degree 2-3 are zeros
+        f_rest = torch.zeros(N, 45, dtype=torch.float32)
+        f_rest[:, :9] = f_rest_deg1
+    else:
+        # Scene model: color RGB [0,1] -> SH DC term
+        color = gaussians["color"].cpu().float().clamp(0, 1)  # (N, 3)
+        f_dc = (color - 0.5) / C0
+        f_rest = torch.zeros(N, 45, dtype=torch.float32)
+
+    opacity = gaussians["opacity"].cpu().float()  # (N, 1), already in logit space
+    if opacity.dim() == 1:
+        opacity = opacity.unsqueeze(1)
+
+    # scale: 3DGS stores log(scale)
+    scale = gaussians["scale"].cpu().float()  # (N, 3), softplus output
+    log_scale = torch.log(scale.clamp(min=1e-6))
+
+    rot = gaussians["rotation"].cpu().float()  # (N, 4), unit quaternion (w x y z)
+
+    # Build .ply header
+    props = (
+        ["x", "y", "z", "nx", "ny", "nz"]
+        + [f"f_dc_{i}" for i in range(3)]
+        + [f"f_rest_{i}" for i in range(45)]
+        + ["opacity"]
+        + [f"scale_{i}" for i in range(3)]
+        + [f"rot_{i}" for i in range(4)]
+    )
+    n_props = len(props)
+
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {N}\n"
+    )
+    for p in props:
+        header += f"property float {p}\n"
+    header += "end_header\n"
+
+    normals = torch.zeros(N, 3, dtype=torch.float32)
+
+    # Stack all properties: (N, n_props)
+    data = torch.cat([
+        pos, normals, f_dc, f_rest, opacity, log_scale, rot
+    ], dim=1)  # (N, n_props)
+
+    assert data.shape[1] == n_props, f"Expected {n_props} props, got {data.shape[1]}"
+
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(data.detach().numpy().astype("float32").tobytes())
 
 
 if __name__ == "__main__":

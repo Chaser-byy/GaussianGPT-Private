@@ -173,19 +173,22 @@ class ChunkSampler:
     def sample_chunk(
         self,
         voxel_coords: torch.Tensor,
+        voxel_gaussians: Dict[str, torch.Tensor],
         scene_bounds: Optional[Tuple] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple:
         """Sample a chunk from the scene.
 
         Args:
             voxel_coords: (N, 3) all occupied voxel coordinates in the scene
+            voxel_gaussians: per-voxel Gaussian attributes aligned with voxel_coords
             scene_bounds: optional (min_xyz, max_xyz) bounds
         Returns:
             chunk_coords: (M, 3) voxel coordinates within the chunk (relative)
             chunk_origin: (3,) origin of the chunk in scene coordinates
+            chunk_gaussians: Gaussian attributes for voxels in the chunk
         """
         cx, cy, cz = self.chunk_size
-        chunk_vol = cx * cy * cz
+        # chunk_vol = cx * cy * cz
 
         if scene_bounds is None:
             min_xyz = voxel_coords.min(0).values
@@ -196,17 +199,21 @@ class ChunkSampler:
 
         best_chunk = None
         best_occ = 0.0
+        chunk_vol = min(cx, max_xyz[0].item() - min_xyz[0].item() + 1) * min(cy, max_xyz[1].item() - min_xyz[1].item() + 1) * min(cz, max_xyz[2].item() - min_xyz[2].item() + 1)
+
+        ox_lo = int(min_xyz[0].item())
+        ox_hi = max(ox_lo + 1, int(max_xyz[0].item()) - cx + 2)
+        oy_lo = int(min_xyz[1].item())
+        oy_hi = max(oy_lo + 1, int(max_xyz[1].item()) - cy + 2)
+        oz_lo = int(min_xyz[2].item())
+        oz_hi = max(oz_lo + 1, int(max_xyz[2].item()) - cz + 2)
 
         for _ in range(self.max_tries):
             # Random chunk origin (fixed z=0 for floor alignment)
-            ox_lo = int(min_xyz[0].item())
-            ox_hi = max(ox_lo + 1, int(max_xyz[0].item()) - cx + 2)
-            oy_lo = int(min_xyz[1].item())
-            oy_hi = max(oy_lo + 1, int(max_xyz[1].item()) - cy + 2)
             ox = torch.randint(ox_lo, ox_hi, (1,)).item()
             oy = torch.randint(oy_lo, oy_hi, (1,)).item()
-            oz = int(min_xyz[2].item())  # fixed vertical position
-
+            # oz = int(min_xyz[2].item())  # fixed vertical position
+            oz = torch.randint(oz_lo, oz_hi, (1,)).item()
             origin = torch.tensor([ox, oy, oz], dtype=torch.long)
 
             # Find voxels within chunk
@@ -217,13 +224,14 @@ class ChunkSampler:
                 (rel[:, 2] >= 0) & (rel[:, 2] < cz)
             )
             chunk_voxels = rel[mask]
+            chunk_gaussians = {key: val[mask] for key, val in voxel_gaussians.items()}
             occ = len(chunk_voxels) / chunk_vol
 
             if occ >= self.min_occupancy:
-                return chunk_voxels, origin
+                return chunk_voxels, origin, chunk_gaussians
 
             if occ > best_occ:
                 best_occ = occ
-                best_chunk = (chunk_voxels, origin)
+                best_chunk = (chunk_voxels, origin, chunk_gaussians)
 
         return best_chunk

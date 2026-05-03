@@ -8,9 +8,9 @@ model:
   use_sh: false       # No view-dependent appearance for scenes
 
 data:
-  data_dir: "data/scenes"
+  data_dir: "/home/chengtianle/GaussianGPT/data/overfit"
   base_voxel_size: 0.025   # 2.5 cm
-  chunk_size: [128, 128, 128]  # Chunk in base voxels (128*0.025m=3.2m); encoder->latent chunk=16^3
+  chunk_size: [256, 256, 256]  # Chunk in base voxels (128*0.025m=3.2m); encoder->latent chunk=16^3
   min_occupancy_ae: 0.2     # Minimum occupancy for chunk sampling
 
 loss:
@@ -21,7 +21,9 @@ loss:
   n_images: 12              # Number of images for re-rendering loss
 
 training:
-  epochs: 200
-  batch_size: 8             # Effective batch size (paper: 8 with 4 GPUs)
+  epochs: 5000
+  batch_size: 4             # Effective batch size (paper: 8 with 4 GPUs)
   lr: 1.0e-4
   lr_min_ratio: 0.1         # Cosine decay to 10% of initial lr
+  save_every: 1000
+  val_every_steps: 4000        # Run validation every N optimizer steps; 0 disables
