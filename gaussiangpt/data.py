@@ -47,7 +47,9 @@ class GaussianSceneDataset(Dataset):
         augment: bool = True,
         split: str = "train",
         split_ratio: float = 0.9,
-    ):  
+        fixed_chunk: bool = False,
+        voxel_dedup: str = "random",
+    ):
         data_dir = data_dir + "/" + split
         super().__init__()
         self.data_dir = data_dir
@@ -56,7 +58,24 @@ class GaussianSceneDataset(Dataset):
         self.latent_voxel_size = base_voxel_size * (2 ** n_down)
         self.chunk_size = chunk_size
         self.augment = augment
-        self.chunk_sampler = ChunkSampler(chunk_size, min_occupancy=min_occupancy)
+        # ``fixed_chunk=True`` makes the chunk sampler deterministic per
+        # scene -- handy for verifying the model can overfit a static
+        # target. With ``augment`` off, the dataset becomes a pure
+        # memorisation task.
+        self.chunk_sampler = ChunkSampler(
+            chunk_size, min_occupancy=min_occupancy, deterministic=fixed_chunk,
+        )
+        # ``voxel_dedup`` controls which Gaussian survives per voxel when
+        # multiple Gaussians fall in the same voxel:
+        #   * "random"  -- paper-faithful (subsample uniformly).
+        #   * "first"   -- deterministic; lowest input index per voxel.
+        #   * "nearest" -- deterministic; pick the Gaussian whose centre
+        #                  is closest to the voxel centre (cleanest GT).
+        self.voxel_dedup = (voxel_dedup or "random").lower()
+        if self.voxel_dedup not in ("random", "first", "nearest"):
+            raise ValueError(
+                f"voxel_dedup must be 'random'|'first'|'nearest', got {voxel_dedup!r}"
+            )
 
         # Find all scene files
         self.files = sorted([
@@ -323,27 +342,60 @@ class GaussianSceneDataset(Dataset):
         """Assign Gaussians to voxels at base voxel resolution.
 
         Returns voxel coordinates and per-voxel Gaussian attributes
-        (one Gaussian per voxel, randomly sampled for training).
+        (one Gaussian per voxel, selected per ``self.voxel_dedup``).
         """
         positions = gaussians["offset"]
         voxel_coords = torch.floor(positions / self.base_voxel_size).long()
 
-        if self.split == "train":
-            # Random permutation makes the first occurrence per voxel a random Gaussian.
-            perm = torch.randperm(len(positions), device=positions.device)
+        # Choose the per-voxel survivor index according to the dedup
+        # strategy. ``selected_idx`` will end up as a (n_voxels,) tensor
+        # of indices into the original ``positions`` array.
+        if self.voxel_dedup == "nearest":
+            # Compute squared distance from each Gaussian to its voxel's
+            # centre, then pick the closest one per voxel.
+            voxel_centers = (voxel_coords.to(positions.dtype) + 0.5) * self.base_voxel_size
+            dist_sq = ((positions - voxel_centers) ** 2).sum(dim=-1)
+
+            unique_coords, inverse = torch.unique(voxel_coords, dim=0, return_inverse=True)
+            n_voxels = unique_coords.shape[0]
+
+            # For each unique voxel, find the index with minimum dist_sq.
+            # Encode (dist, original_idx) into a single int64 sort key so
+            # ``scatter_reduce_(amin)`` returns the index of the minimum.
+            INF = torch.tensor(float("inf"), device=positions.device)
+            min_dist = torch.full((n_voxels,), float("inf"), device=positions.device)
+            min_dist.scatter_reduce_(0, inverse, dist_sq, reduce="amin", include_self=True)
+            # Mark the winners: any input row whose dist matches its
+            # voxel's min. Ties are broken by lowest original index.
+            is_winner = dist_sq == min_dist[inverse]
+            big = positions.shape[0]
+            tie_score = torch.where(
+                is_winner,
+                torch.arange(big, dtype=torch.long, device=positions.device),
+                torch.full((big,), big, dtype=torch.long, device=positions.device),
+            )
+            selected_idx = torch.full(
+                (n_voxels,), big, dtype=torch.long, device=positions.device,
+            )
+            selected_idx.scatter_reduce_(0, inverse, tie_score, reduce="amin", include_self=True)
         else:
-            # Keep validation/test deterministic.
-            perm = torch.arange(len(positions), device=positions.device)
+            if self.voxel_dedup == "first" or self.split != "train":
+                # Deterministic: lowest input index per voxel.
+                perm = torch.arange(len(positions), device=positions.device)
+            else:
+                # Paper-faithful random subsampling.
+                perm = torch.randperm(len(positions), device=positions.device)
 
-        permuted_coords = voxel_coords[perm]
-        unique_coords, inverse = torch.unique(permuted_coords, dim=0, return_inverse=True)
-        n_voxels = unique_coords.shape[0]
+            permuted_coords = voxel_coords[perm]
+            unique_coords, inverse = torch.unique(permuted_coords, dim=0, return_inverse=True)
+            n_voxels = unique_coords.shape[0]
 
-        # Vectorized first occurrence in the permuted order.
-        src = torch.arange(len(positions), dtype=torch.long, device=positions.device)
-        first_occ = torch.full((n_voxels,), len(positions), dtype=torch.long, device=positions.device)
-        first_occ.scatter_reduce_(0, inverse, src, reduce="amin", include_self=True)
-        selected_idx = perm[first_occ]
+            src = torch.arange(len(positions), dtype=torch.long, device=positions.device)
+            first_occ = torch.full(
+                (n_voxels,), len(positions), dtype=torch.long, device=positions.device,
+            )
+            first_occ.scatter_reduce_(0, inverse, src, reduce="amin", include_self=True)
+            selected_idx = perm[first_occ]
 
         voxel_gaussians = {key: val[selected_idx] for key, val in gaussians.items()}
         voxel_centers = (unique_coords.to(positions.dtype) + 0.5) * self.base_voxel_size

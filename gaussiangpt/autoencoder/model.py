@@ -37,6 +37,8 @@ class GaussianAutoencoder(nn.Module):
         encoder_expand: int = 16,
         decoder_hidden: int = 64,
         voxel_size: float = 0.025,
+        norm: str = "bn",
+        color_activation: str = "clamp",
     ):
         super().__init__()
         num_bits = int(math.log2(codebook_size))
@@ -50,9 +52,14 @@ class GaussianAutoencoder(nn.Module):
         )
         in_ch = self.attr_encoder.out_dim
 
-        # Sparse 3D CNN (latent_ch == num_bits for LFQ)
-        self.encoder = SparseEncoder(in_ch=in_ch, base_ch=base_ch, latent_ch=num_bits, n_down=n_down)
-        self.decoder = SparseDecoder(latent_ch=num_bits, base_ch=base_ch, out_ch=in_ch, n_up=n_down)
+        # Sparse 3D CNN (latent_ch == num_bits for LFQ). ``norm`` selects
+        # between BatchNorm (paper-faithful) / InstanceNorm / Identity.
+        self.encoder = SparseEncoder(
+            in_ch=in_ch, base_ch=base_ch, latent_ch=num_bits, n_down=n_down, norm=norm,
+        )
+        self.decoder = SparseDecoder(
+            latent_ch=num_bits, base_ch=base_ch, out_ch=in_ch, n_up=n_down, norm=norm,
+        )
 
         # LFQ quantizer
         self.quantizer = LookupFreeQuantizer(codebook_size=codebook_size)
@@ -61,11 +68,14 @@ class GaussianAutoencoder(nn.Module):
 
         # Gaussian attribute decoder. Per GaussianGPT Appendix C, offsets
         # are predicted as unbounded world-space values (no offset_bound).
+        # ``color_activation`` defaults to the paper's hard clamp; setting
+        # it to "sigmoid" relieves the clamp's dead-gradient pathology.
         self.attr_decoder = GaussianAttributeDecoder(
             in_dim=in_ch,
             use_sh=use_sh,
             hidden=decoder_hidden,
             voxel_size=voxel_size,
+            color_activation=color_activation,
         )
 
     def _make_sparse_tensor(self, voxel_features: torch.Tensor, voxel_coords: torch.Tensor):

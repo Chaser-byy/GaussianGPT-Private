@@ -210,7 +210,10 @@ class GaussianAttributeDecoder(nn.Module):
       * scale    -> softplus  (positive world-space sizes)
       * opacity  -> clamp(-10, 10)  (logit space)
       * rotation -> F.normalize  (unit quaternion)
-      * color    -> clamp(0, 1)
+      * color    -> clamp(0, 1) by default; can be switched to ``sigmoid``
+                    via ``color_activation='sigmoid'`` for diagnostic
+                    purposes (the hard clamp kills gradients for any
+                    prediction outside [0, 1]).
     """
 
     def __init__(
@@ -219,10 +222,16 @@ class GaussianAttributeDecoder(nn.Module):
         use_sh: bool = False,
         hidden: int = 64,
         voxel_size: float = 0.025,
+        color_activation: str = "clamp",
     ):
         super().__init__()
         self.use_sh = use_sh
         self.voxel_size = float(voxel_size)
+        self.color_activation = (color_activation or "clamp").lower()
+        if self.color_activation not in ("clamp", "sigmoid"):
+            raise ValueError(
+                f"color_activation must be 'clamp' or 'sigmoid', got {color_activation!r}"
+            )
         attrs = dict(ATTR_DIMS)
         if use_sh:
             attrs["sh"] = SH_DIM
@@ -230,11 +239,14 @@ class GaussianAttributeDecoder(nn.Module):
         # Initial-bias presets: chosen so the *post-processed* output
         # starts at a reasonable default and the network has good initial
         # visibility (per Appendix C).
+        # Note: when ``color_activation='sigmoid'``, bias=0.0 gives
+        # sigmoid(0)=0.5 (mid grey), matching the clamp-mode init.
+        color_bias = 0.5 if self.color_activation == "clamp" else 0.0
         init_biases = {
             "offset": 0.0,                                  # identity -> centred at voxel
             "scale": _softplus_inverse(self.voxel_size),    # softplus(bias) ~= voxel_size
             "opacity": 0.0,                                 # logit 0 -> sigmoid 0.5 occupancy
-            "color": 0.5,                                   # clamp(0.5) = 0.5 mid grey
+            "color": color_bias,
             "sh": 0.0,
             # rotation handled inside the head (identity quaternion).
         }
@@ -273,5 +285,7 @@ class GaussianAttributeDecoder(nn.Module):
         if name == "rotation":
             return F.normalize(x, dim=-1)
         if name == "color":
+            if self.color_activation == "sigmoid":
+                return torch.sigmoid(x)
             return x.clamp(0.0, 1.0)
         return x

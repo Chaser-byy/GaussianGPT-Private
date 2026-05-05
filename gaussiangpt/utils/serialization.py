@@ -158,6 +158,12 @@ class ChunkSampler:
     Paper: chunks have fixed vertical positions to align floor heights.
     Minimum occupancy threshold: 0.2 for autoencoder, 0.3 for GPT.
     Up to 10 candidate chunks are tried; if none meet threshold, use highest.
+
+    For overfit/debug runs, ``deterministic=True`` makes ``sample_chunk``
+    return the same chunk every time it is called for the same scene
+    (the chunk with the highest occupancy on a coarse grid of origins),
+    bypassing all randomness. This is useful to verify whether the model
+    can actually overfit a fixed target.
     """
 
     def __init__(
@@ -165,10 +171,30 @@ class ChunkSampler:
         chunk_size: Tuple[int, int, int],
         min_occupancy: float = 0.2,
         max_tries: int = 10,
+        deterministic: bool = False,
     ):
         self.chunk_size = chunk_size
         self.min_occupancy = min_occupancy
         self.max_tries = max_tries
+        self.deterministic = bool(deterministic)
+
+    def _candidate_origins(self, ox_lo, ox_hi, oy_lo, oy_hi, oz_lo, oz_hi):
+        """Generate a coarse, deterministic grid of candidate origins.
+
+        Used by deterministic mode. Aims for at most ~3*3*3 = 27 candidates
+        regardless of scene size, with a fallback to the lo corner if the
+        scene is small enough that hi-lo<=1 in some dimension.
+        """
+        def _three(lo, hi):
+            if hi - lo <= 1:
+                return [lo]
+            mid = (lo + hi) // 2
+            return sorted({lo, mid, max(lo + 1, hi - 1)})
+
+        for ox in _three(ox_lo, ox_hi):
+            for oy in _three(oy_lo, oy_hi):
+                for oz in _three(oz_lo, oz_hi):
+                    yield ox, oy, oz
 
     def sample_chunk(
         self,
@@ -188,7 +214,6 @@ class ChunkSampler:
             chunk_gaussians: Gaussian attributes for voxels in the chunk
         """
         cx, cy, cz = self.chunk_size
-        # chunk_vol = cx * cy * cz
 
         if scene_bounds is None:
             min_xyz = voxel_coords.min(0).values
@@ -199,7 +224,11 @@ class ChunkSampler:
 
         best_chunk = None
         best_occ = 0.0
-        chunk_vol = min(cx, max_xyz[0].item() - min_xyz[0].item() + 1) * min(cy, max_xyz[1].item() - min_xyz[1].item() + 1) * min(cz, max_xyz[2].item() - min_xyz[2].item() + 1)
+        chunk_vol = (
+            min(cx, max_xyz[0].item() - min_xyz[0].item() + 1)
+            * min(cy, max_xyz[1].item() - min_xyz[1].item() + 1)
+            * min(cz, max_xyz[2].item() - min_xyz[2].item() + 1)
+        )
 
         ox_lo = int(min_xyz[0].item())
         ox_hi = max(ox_lo + 1, int(max_xyz[0].item()) - cx + 2)
@@ -208,15 +237,21 @@ class ChunkSampler:
         oz_lo = int(min_xyz[2].item())
         oz_hi = max(oz_lo + 1, int(max_xyz[2].item()) - cz + 2)
 
-        for _ in range(self.max_tries):
-            # Random chunk origin (fixed z=0 for floor alignment)
-            ox = torch.randint(ox_lo, ox_hi, (1,)).item()
-            oy = torch.randint(oy_lo, oy_hi, (1,)).item()
-            # oz = int(min_xyz[2].item())  # fixed vertical position
-            oz = torch.randint(oz_lo, oz_hi, (1,)).item()
+        if self.deterministic:
+            origins = list(self._candidate_origins(ox_lo, ox_hi, oy_lo, oy_hi, oz_lo, oz_hi))
+        else:
+            origins = None  # will be sampled in the loop below
+
+        n_iters = len(origins) if origins is not None else self.max_tries
+        for i in range(n_iters):
+            if origins is not None:
+                ox, oy, oz = origins[i]
+            else:
+                ox = torch.randint(ox_lo, ox_hi, (1,)).item()
+                oy = torch.randint(oy_lo, oy_hi, (1,)).item()
+                oz = torch.randint(oz_lo, oz_hi, (1,)).item()
             origin = torch.tensor([ox, oy, oz], dtype=torch.long)
 
-            # Find voxels within chunk
             rel = voxel_coords - origin
             mask = (
                 (rel[:, 0] >= 0) & (rel[:, 0] < cx) &
@@ -227,7 +262,10 @@ class ChunkSampler:
             chunk_gaussians = {key: val[mask] for key, val in voxel_gaussians.items()}
             occ = len(chunk_voxels) / chunk_vol
 
-            if occ >= self.min_occupancy:
+            # In deterministic mode we always exhaust all candidates and
+            # return the highest-occupancy one. In random mode, an early
+            # exit on min_occupancy preserves the original behaviour.
+            if not self.deterministic and occ >= self.min_occupancy:
                 return chunk_voxels, origin, chunk_gaussians
 
             if occ > best_occ:

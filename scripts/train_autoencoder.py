@@ -537,6 +537,33 @@ def train(cfg: dict, args):
     n_gpus = torch.cuda.device_count()
     print(f"Using {n_gpus} GPU(s), device: {device}")
 
+    # ---- Debug toggles (all OFF by default = paper-faithful) ----
+    # See README / configs/autoencoder_scene.yaml for the full list.
+    debug_cfg = cfg.get("debug", {}) or {}
+    norm_kind = str(debug_cfg.get("norm", "bn")).lower()
+    color_act = str(debug_cfg.get("color_activation", "clamp")).lower()
+    fixed_chunk = bool(debug_cfg.get("fixed_chunk", False))
+    no_augment = bool(debug_cfg.get("no_augment", False))
+    voxel_dedup = str(debug_cfg.get("voxel_dedup", "random")).lower()
+    grad_clip = float(debug_cfg.get("grad_clip", 1.0))
+    log_grad_norm_every = int(debug_cfg.get("log_grad_norm_every", 0))
+    if any([
+        norm_kind != "bn",
+        color_act != "clamp",
+        fixed_chunk,
+        no_augment,
+        voxel_dedup != "random",
+        grad_clip != 1.0,
+        log_grad_norm_every > 0,
+    ]):
+        print(
+            "[debug] norm=" + norm_kind
+            + f" color_activation={color_act}"
+            + f" fixed_chunk={fixed_chunk} no_augment={no_augment}"
+            + f" voxel_dedup={voxel_dedup} grad_clip={grad_clip}"
+            + f" log_grad_norm_every={log_grad_norm_every}"
+        )
+
     # Model
     model = GaussianAutoencoder(
         base_ch=cfg["model"]["base_ch"],
@@ -544,6 +571,8 @@ def train(cfg: dict, args):
         codebook_size=cfg["model"]["codebook_size"],
         use_sh=cfg["model"].get("use_sh", False),
         voxel_size=cfg["data"]["base_voxel_size"],
+        norm=norm_kind,
+        color_activation=color_act,
     ).to(device)
 
     if n_gpus > 1:
@@ -557,8 +586,10 @@ def train(cfg: dict, args):
         n_down=cfg["model"]["n_down"],
         chunk_size=tuple(cfg["data"]["chunk_size"]),
         min_occupancy=cfg["data"].get("min_occupancy_ae", 0.2),
-        augment=True,
+        augment=(not no_augment),
         split="train",
+        fixed_chunk=fixed_chunk,
+        voxel_dedup=voxel_dedup,
     )
     val_dataset = GaussianSceneDataset(
         data_dir=data_dir,
@@ -568,6 +599,10 @@ def train(cfg: dict, args):
         min_occupancy=cfg["data"].get("min_occupancy_ae", 0.2),
         augment=False,
         split="val",
+        # Validation always uses deterministic chunks; voxel dedup tracks
+        # the train setting so the GT representation stays consistent.
+        fixed_chunk=fixed_chunk,
+        voxel_dedup=voxel_dedup,
     )
 
     batch_size = args.batch_size or cfg["training"]["batch_size"]
@@ -608,15 +643,20 @@ def train(cfg: dict, args):
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
     global_step = 0
 
-    # ---- Dead-gradient diagnostic for the colour clamp ----
-    # GaussianGPT (Appendix C) uses a hard `clamp(0, 1)` on colour, which
-    # has zero gradient outside [0, 1]. This catches the case where the
-    # colour head's `proj_out` bias drifts out of range and stops learning.
+    # ---- Per-head decoder diagnostics ----
+    # Multi-line readout per `color_check_every` steps:
+    #   * colour head pre-activation distribution (clamp/sigmoid aware)
+    #   * opacity distribution + decisive fraction (alpha near 0 or 1) --
+    #     a low decisive fraction is the classic "soft averaging"
+    #     failure mode that turns vivid colours into grey mush.
+    #   * scale distribution vs voxel size -- "ballooning" Gaussians
+    #     also cause desaturation and detail loss.
     # Set `diagnostics.color_check_every <= 0` in the config to disable.
     diag_cfg = cfg.get("diagnostics", {})
     color_diag = ColorClampDiagnostics(
         raw_model.attr_decoder,
         every=int(diag_cfg.get("color_check_every", 200)),
+        voxel_size=float(cfg["data"]["base_voxel_size"]),
     )
 
     # ---- Optional rendering / perceptual supervision ----
@@ -663,7 +703,12 @@ def train(cfg: dict, args):
                 perceptual=perceptual,
             )
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # ``clip_grad_norm_`` returns the *pre-clip* total gradient
+            # norm; logging it occasionally is one of the cheapest ways
+            # to spot the "everything is being clipped" pathology.
+            pre_clip_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), grad_clip,
+            )
             optimizer.step()
             global_step += 1
 
@@ -675,6 +720,14 @@ def train(cfg: dict, args):
                     f"Loss: {batch_loss.item():.4f} "
                     f"rgb: {batch_rgb:.4f} perc: {batch_perc:.4f} "
                     f"occ: {batch_occ:.4f} lfq: {batch_lfq:.4f}"
+                )
+            if log_grad_norm_every > 0 and global_step % log_grad_norm_every == 0:
+                clipped = float(pre_clip_norm) > grad_clip
+                print(
+                    f"  [grad] step={global_step} "
+                    f"pre_clip_norm={float(pre_clip_norm):.3f} "
+                    f"clip={grad_clip:.2f} "
+                    f"{'(clipped)' if clipped else ''}"
                 )
 
             # Colour-clamp dead-gradient check. Reads .grad (still alive

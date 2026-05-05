@@ -1,4 +1,13 @@
-"""Sparse 3D CNN Encoder-Decoder following L3DG architecture."""
+"""Sparse 3D CNN Encoder-Decoder following L3DG architecture.
+
+Normalisation layers are configurable via the ``norm`` argument so that
+training-time pathologies of BatchNorm (small batch + heterogeneous
+chunks) can be diagnosed by swapping in InstanceNorm or no-op:
+
+  * ``"bn"``       -- MinkowskiBatchNorm (paper-faithful, default).
+  * ``"instance"`` -- MinkowskiInstanceNorm; safer for batch_size <= 4.
+  * ``"none"``     -- nn.Identity; useful to isolate norm-related issues.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,13 +24,27 @@ except ImportError:
 
 if HAS_MINKOWSKI:
 
+    def _make_norm(kind: str, out_ch: int) -> nn.Module:
+        """Build a sparse normalisation layer by name.
+
+        ``kind`` is case-insensitive and accepts ``bn``, ``instance``, ``none``.
+        """
+        kind = (kind or "bn").lower()
+        if kind == "bn":
+            return ME.MinkowskiBatchNorm(out_ch)
+        if kind in ("instance", "in"):
+            return ME.MinkowskiInstanceNorm(out_ch)
+        if kind in ("none", "id", "identity"):
+            return nn.Identity()
+        raise ValueError(f"Unknown norm kind: {kind!r}")
+
     class SparseResBlock(nn.Module):
-        def __init__(self, in_ch: int, out_ch: int):
+        def __init__(self, in_ch: int, out_ch: int, norm: str = "bn"):
             super().__init__()
             self.conv1 = ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=3, stride=1, dimension=3)
-            self.bn1 = ME.MinkowskiBatchNorm(out_ch)
+            self.bn1 = _make_norm(norm, out_ch)
             self.conv2 = ME.MinkowskiConvolution(out_ch, out_ch, kernel_size=3, stride=1, dimension=3)
-            self.bn2 = ME.MinkowskiBatchNorm(out_ch)
+            self.bn2 = _make_norm(norm, out_ch)
             self.relu = ME.MinkowskiReLU(inplace=True)
             self.skip = (
                 ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=1, stride=1, dimension=3)
@@ -35,23 +58,23 @@ if HAS_MINKOWSKI:
             return self.relu(out + res)
 
     class SparseDownBlock(nn.Module):
-        def __init__(self, in_ch: int, out_ch: int):
+        def __init__(self, in_ch: int, out_ch: int, norm: str = "bn"):
             super().__init__()
             self.conv = ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=2, stride=2, dimension=3)
-            self.bn = ME.MinkowskiBatchNorm(out_ch)
+            self.bn = _make_norm(norm, out_ch)
             self.relu = ME.MinkowskiReLU(inplace=True)
-            self.res = SparseResBlock(out_ch, out_ch)
+            self.res = SparseResBlock(out_ch, out_ch, norm=norm)
 
         def forward(self, x):
             return self.res(self.relu(self.bn(self.conv(x))))
 
     class SparseUpBlock(nn.Module):
-        def __init__(self, in_ch: int, out_ch: int):
+        def __init__(self, in_ch: int, out_ch: int, norm: str = "bn"):
             super().__init__()
             self.conv = ME.MinkowskiConvolutionTranspose(in_ch, out_ch, kernel_size=2, stride=2, dimension=3)
-            self.bn = ME.MinkowskiBatchNorm(out_ch)
+            self.bn = _make_norm(norm, out_ch)
             self.relu = ME.MinkowskiReLU(inplace=True)
-            self.res = SparseResBlock(out_ch, out_ch)
+            self.res = SparseResBlock(out_ch, out_ch, norm=norm)
             self.occ_head = ME.MinkowskiLinear(out_ch, 1)
 
         def forward(self, x):
@@ -59,13 +82,22 @@ if HAS_MINKOWSKI:
             return x, self.occ_head(x)
 
     class SparseEncoder(nn.Module):
-        def __init__(self, in_ch: int, base_ch: int = 128, latent_ch: int = 12, n_down: int = 3):
+        def __init__(
+            self,
+            in_ch: int,
+            base_ch: int = 128,
+            latent_ch: int = 12,
+            n_down: int = 3,
+            norm: str = "bn",
+        ):
             super().__init__()
             self.stem = ME.MinkowskiConvolution(in_ch, base_ch, kernel_size=3, stride=1, dimension=3)
-            self.stem_bn = ME.MinkowskiBatchNorm(base_ch)
+            self.stem_bn = _make_norm(norm, base_ch)
             self.stem_relu = ME.MinkowskiReLU(inplace=True)
             chs = [base_ch * (2 ** i) for i in range(n_down + 1)]
-            self.downs = nn.ModuleList([SparseDownBlock(chs[i], chs[i + 1]) for i in range(n_down)])
+            self.downs = nn.ModuleList(
+                [SparseDownBlock(chs[i], chs[i + 1], norm=norm) for i in range(n_down)]
+            )
             self.proj = ME.MinkowskiConvolution(chs[-1], latent_ch, kernel_size=1, stride=1, dimension=3)
 
         def forward(self, x):
@@ -75,11 +107,20 @@ if HAS_MINKOWSKI:
             return self.proj(x)
 
     class SparseDecoder(nn.Module):
-        def __init__(self, latent_ch: int, base_ch: int = 128, out_ch: Optional[int] = None, n_up: int = 3):
+        def __init__(
+            self,
+            latent_ch: int,
+            base_ch: int = 128,
+            out_ch: Optional[int] = None,
+            n_up: int = 3,
+            norm: str = "bn",
+        ):
             super().__init__()
             chs = list(reversed([base_ch * (2 ** i) for i in range(n_up + 1)]))
             self.proj = ME.MinkowskiConvolution(latent_ch, chs[0], kernel_size=1, stride=1, dimension=3)
-            self.ups = nn.ModuleList([SparseUpBlock(chs[i], chs[i + 1]) for i in range(n_up)])
+            self.ups = nn.ModuleList(
+                [SparseUpBlock(chs[i], chs[i + 1], norm=norm) for i in range(n_up)]
+            )
             self.out_proj = ME.MinkowskiConvolution(chs[-1], out_ch or base_ch, kernel_size=1, stride=1, dimension=3)
 
         def forward(self, x):
@@ -105,7 +146,14 @@ else:
             return self.relu(self.net(x) + x)
 
     class SparseEncoder(nn.Module):
-        def __init__(self, in_ch: int, base_ch: int = 128, latent_ch: int = 12, n_down: int = 3):
+        def __init__(
+            self,
+            in_ch: int,
+            base_ch: int = 128,
+            latent_ch: int = 12,
+            n_down: int = 3,
+            norm: str = "bn",  # accepted for API parity; dense fallback ignores it
+        ):
             super().__init__()
             chs = [base_ch * (2 ** i) for i in range(n_down + 1)]
             layers: List[nn.Module] = [
@@ -124,7 +172,14 @@ else:
             return self.net(x)
 
     class SparseDecoder(nn.Module):
-        def __init__(self, latent_ch: int, base_ch: int = 128, out_ch: Optional[int] = None, n_up: int = 3):
+        def __init__(
+            self,
+            latent_ch: int,
+            base_ch: int = 128,
+            out_ch: Optional[int] = None,
+            n_up: int = 3,
+            norm: str = "bn",  # accepted for API parity; dense fallback ignores it
+        ):
             super().__init__()
             chs = list(reversed([base_ch * (2 ** i) for i in range(n_up + 1)]))
             self.proj = nn.Conv3d(latent_ch, chs[0], 1)
