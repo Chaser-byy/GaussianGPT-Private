@@ -359,6 +359,27 @@ class GaussianSceneDataset(Dataset):
             unique_coords, inverse = torch.unique(voxel_coords, dim=0, return_inverse=True)
             n_voxels = unique_coords.shape[0]
 
+            # # 1. 计算每个体素的点数
+            # voxel_counts = torch.bincount(inverse).cpu().numpy()
+
+            # # 2. 绘制并保存统计图
+            # import matplotlib.pyplot as plt
+            
+            # plt.figure(figsize=(10, 6))
+            # plt.hist(voxel_counts, bins=range(1, voxel_counts.max() + 2), edgecolor='black', alpha=0.7)
+            # plt.title(f"Distribution of Gaussian Points per Voxel (Total Voxels: {n_voxels})")
+            # plt.xlabel("Number of Points in a Voxel")
+            # plt.ylabel("Frequency (Number of Voxels)")
+            # plt.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            # # 保存到本地文件
+            # save_path = "/home/chengtianle/GaussianGPT/output/voxel_distribution.png"
+            # plt.savefig(save_path)
+            # plt.close()
+            
+            # print(f"统计图已保存至: {save_path}")
+            # assert False
+
             # For each unique voxel, find the index with minimum dist_sq.
             # Encode (dist, original_idx) into a single int64 sort key so
             # ``scatter_reduce_(amin)`` returns the index of the minimum.

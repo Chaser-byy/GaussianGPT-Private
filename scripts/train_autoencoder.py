@@ -637,6 +637,10 @@ def train(cfg: dict, args):
         print(f"Resumed from epoch {start_epoch}")
 
     os.makedirs(args.output_dir, exist_ok=True)
+    config_save_path = os.path.join(args.output_dir, "config.yaml")
+    with open(config_save_path, 'w') as f:
+        yaml.dump(cfg, f, default_flow_style=False)
+    print(f"Config saved to: {config_save_path}")
 
     # Note: MinkowskiEngine is incompatible with DataParallel's scatter mechanism.
     # Use the unwrapped model for forward; DataParallel is only safe for dense fallback.
