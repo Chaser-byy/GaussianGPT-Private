@@ -88,9 +88,13 @@ class GaussianAutoencoder(nn.Module):
             ME.SparseTensor with batch dimension prepended (all batch_idx=0)
         """
         import MinkowskiEngine as ME
-        batch_idx = torch.zeros(voxel_coords.shape[0], 1, dtype=torch.int, device=voxel_coords.device)
-        coords_me = torch.cat([batch_idx, voxel_coords.int()], dim=1)  # (N, 4): [batch, x, y, z]
-        return ME.SparseTensor(features=voxel_features, coordinates=coords_me)
+        if voxel_coords.shape[1] == 4:
+        # 直接使用 collate 组装好的 [b, x, y, z] 坐标
+            return ME.SparseTensor(features=voxel_features, coordinates=voxel_coords.int())
+        else :
+            batch_idx = torch.zeros(voxel_coords.shape[0], 1, dtype=torch.int, device=voxel_coords.device)
+            coords_me = torch.cat([batch_idx, voxel_coords.int()], dim=1)  # (N, 4): [batch, x, y, z]
+            return ME.SparseTensor(features=voxel_features, coordinates=coords_me)
 
     def forward(
         self,

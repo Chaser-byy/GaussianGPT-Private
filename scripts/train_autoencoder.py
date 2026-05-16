@@ -176,113 +176,209 @@ def _render_loss_for_sample(
     return l_rgb, l_perc
 
 
+# def compute_batch_loss(
+#     raw_model,
+#     batch_list,
+#     cfg: dict,
+#     device: torch.device,
+#     backward: bool = False,
+#     perceptual: nn.Module = None,
+#     rng: torch.Generator = None,
+# ):
+#     """Compute one sparse batch loss, optionally backpropagating per-sample losses.
+
+#     GaussianGPT Eq. (1):
+#         L = lambda_rgb  * L1(renderings)         # L3DG L_RGB
+#           + lambda_perc * VGG19(renderings)      # L3DG L_perc
+#           + lambda_occ  * BCE(occupancy)         # L3DG L_occ
+#           + lambda_lfq  * softplus(L_LFQ + 5)    # LFQ codebook entropy
+#     """
+#     loss_cfg = cfg.get("loss", {})
+#     lambda_rgb = float(loss_cfg.get("lambda_rgb", 0.0))
+#     lambda_perc = float(loss_cfg.get("lambda_perc", 0.0))
+#     lambda_occ = float(loss_cfg.get("lambda_occ", 0.0))
+#     lambda_lfq = float(loss_cfg.get("lambda_lfq", 0.0))
+
+#     batch_loss = torch.tensor(0.0, device=device)
+#     batch_occ = batch_lfq = 0.0
+#     batch_rgb = batch_perc = 0.0
+#     n = max(len(batch_list), 1)
+
+#     for sample in batch_list:
+#         voxel_coords = sample["voxel_coords"].to(device)
+#         gaussians = {k: v.to(device) for k, v in sample.items()
+#                      if k in ("offset", "scale", "opacity", "rotation", "color", "sh")}
+
+#         pred_gaussians, occ_list, lfq_loss, indices = raw_model(gaussians, voxel_coords)
+
+#         # ---- L_occ: BCE on the per-stage occupancy logits ----
+#         from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
+#         l_occ = torch.tensor(0.0, device=device)
+#         if occ_list:
+#             for stage_idx, occ in enumerate(occ_list):
+#                 if HAS_MINKOWSKI:
+#                     occ_feat = occ.F  # (M, 1)
+#                     targets = torch.ones(occ_feat.shape[0], device=device)
+#                 else:
+#                     # Dense: occ is (1, 1, X', Y', Z')
+#                     scale = 2 ** (len(occ_list) - stage_idx)
+#                     occ_flat = occ.view(-1)
+#                     gt_grid = torch.zeros_like(occ_flat)
+#                     stage_vc = (voxel_coords // scale).clamp(0, occ.shape[2] - 1)
+#                     flat_idx = (
+#                         stage_vc[:, 0] * occ.shape[3] * occ.shape[4]
+#                         + stage_vc[:, 1] * occ.shape[4]
+#                         + stage_vc[:, 2]
+#                     )
+#                     gt_grid.scatter_(0, flat_idx, 1.0)
+#                     occ_feat = occ_flat.unsqueeze(-1)
+#                     targets = gt_grid
+#                 l_occ = l_occ + torch.nn.functional.binary_cross_entropy_with_logits(
+#                     occ_feat.squeeze(-1), targets
+#                 )
+#             l_occ = l_occ / len(occ_list)
+
+#         # ---- L_RGB / L_perc: rendering supervision (L3DG-style) ----
+#         if (lambda_rgb > 0 or lambda_perc > 0) and "position" not in pred_gaussians:
+#             # The decoder doesn't output absolute positions; we attach them
+#             # here so the renderer can use them. The same is done in
+#             # `_render_loss_for_sample` for the GT.
+#             pred_gaussians["position"] = _build_world_positions(
+#                 sample, pred_gaussians["offset"], cfg["data"]["base_voxel_size"], device,
+#             )
+#         if lambda_rgb > 0 or lambda_perc > 0:
+#             l_rgb, l_perc = _render_loss_for_sample(
+#                 sample, pred_gaussians, gaussians, cfg, device,
+#                 perceptual=perceptual, rng=rng,
+#             )
+#         else:
+#             l_rgb = torch.zeros((), device=device)
+#             l_perc = torch.zeros((), device=device)
+
+#         # GaussianGPT Eq. (1): the LFQ entropy term is wrapped in
+#         #     λ_LFQ · softplus(L_LFQ + 5)
+#         # The purpose of the offset + softplus is purely cosmetic --- it
+#         # keeps the displayed loss positive (since L_LFQ ∈ [−log 2, +log 2]
+#         # can dip below zero) without meaningfully changing the gradient
+#         # (sigmoid(L_LFQ + 5) ≈ 1 throughout the operating range).
+#         l_lfq = torch.nn.functional.softplus(lfq_loss + 5.0)
+
+#         sample_loss = (
+#             lambda_rgb * l_rgb
+#             + lambda_perc * l_perc
+#             + lambda_occ * l_occ
+#             + lambda_lfq * l_lfq
+#         ) / n
+
+#         if backward:
+#             sample_loss.backward()
+
+#         batch_loss = batch_loss + sample_loss.detach()
+#         batch_occ += l_occ.item() / n
+#         # Log the actual term that enters the loss (softplus-wrapped), so
+#         # the printed value matches the gradient that backprops.
+#         batch_lfq += l_lfq.item() / n
+#         batch_rgb += float(l_rgb.detach().item()) / n
+#         batch_perc += float(l_perc.detach().item()) / n
+
+#     return batch_loss, batch_occ, batch_lfq, batch_rgb, batch_perc
+
 def compute_batch_loss(
     raw_model,
-    batch_list,
+    batch,             # 关键：此时传入的是由 ase_sparse_collate 打包好的大字典，不再是原版的 list
     cfg: dict,
     device: torch.device,
     backward: bool = False,
     perceptual: nn.Module = None,
     rng: torch.Generator = None,
 ):
-    """Compute one sparse batch loss, optionally backpropagating per-sample losses.
-
-    GaussianGPT Eq. (1):
-        L = lambda_rgb  * L1(renderings)         # L3DG L_RGB
-          + lambda_perc * VGG19(renderings)      # L3DG L_perc
-          + lambda_occ  * BCE(occupancy)         # L3DG L_occ
-          + lambda_lfq  * softplus(L_LFQ + 5)    # LFQ codebook entropy
-    """
     loss_cfg = cfg.get("loss", {})
     lambda_rgb = float(loss_cfg.get("lambda_rgb", 0.0))
     lambda_perc = float(loss_cfg.get("lambda_perc", 0.0))
     lambda_occ = float(loss_cfg.get("lambda_occ", 0.0))
     lambda_lfq = float(loss_cfg.get("lambda_lfq", 0.0))
 
-    batch_loss = torch.tensor(0.0, device=device)
-    batch_occ = batch_lfq = 0.0
-    batch_rgb = batch_perc = 0.0
-    n = max(len(batch_list), 1)
+    # 1. 提取全批次拼接后的 4D 坐标与 14D 原始高斯特征
+    coords = batch["coords"].to(device)       # 形状: (N_total, 4) -> [b, x, y, z]
+    feats = batch["feats"].to(device)         # 形状: (N_total, 14)
+    
+    # 2. 核心衔接机制：将 14 维扁平特征解包切片，对齐师兄原模型 heads 期待的输入字典
+    gaussians = {
+        "offset": feats[:, 0:3],
+        "color": feats[:, 3:6],
+        "opacity": feats[:, 6:7],
+        "scale": feats[:, 7:10],
+        "rotation": feats[:, 10:14]
+    }
 
-    for sample in batch_list:
-        voxel_coords = sample["voxel_coords"].to(device)
-        gaussians = {k: v.to(device) for k, v in sample.items()
-                     if k in ("offset", "scale", "opacity", "rotation", "color", "sh")}
+    # 3. 彻底告别 for 循环！整个 Batch 放入 Sparse CNN 一把梭完成前向推理
+    pred_gaussians, occ_list, lfq_loss, indices = raw_model(gaussians, coords)
 
-        pred_gaussians, occ_list, lfq_loss, indices = raw_model(gaussians, voxel_coords)
-
-        # ---- L_occ: BCE on the per-stage occupancy logits ----
-        from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
-        l_occ = torch.tensor(0.0, device=device)
-        if occ_list:
-            for stage_idx, occ in enumerate(occ_list):
-                if HAS_MINKOWSKI:
-                    occ_feat = occ.F  # (M, 1)
-                    targets = torch.ones(occ_feat.shape[0], device=device)
-                else:
-                    # Dense: occ is (1, 1, X', Y', Z')
-                    scale = 2 ** (len(occ_list) - stage_idx)
-                    occ_flat = occ.view(-1)
-                    gt_grid = torch.zeros_like(occ_flat)
-                    stage_vc = (voxel_coords // scale).clamp(0, occ.shape[2] - 1)
-                    flat_idx = (
-                        stage_vc[:, 0] * occ.shape[3] * occ.shape[4]
-                        + stage_vc[:, 1] * occ.shape[4]
-                        + stage_vc[:, 2]
-                    )
-                    gt_grid.scatter_(0, flat_idx, 1.0)
-                    occ_feat = occ_flat.unsqueeze(-1)
-                    targets = gt_grid
-                l_occ = l_occ + torch.nn.functional.binary_cross_entropy_with_logits(
-                    occ_feat.squeeze(-1), targets
-                )
-            l_occ = l_occ / len(occ_list)
-
-        # ---- L_RGB / L_perc: rendering supervision (L3DG-style) ----
-        if (lambda_rgb > 0 or lambda_perc > 0) and "position" not in pred_gaussians:
-            # The decoder doesn't output absolute positions; we attach them
-            # here so the renderer can use them. The same is done in
-            # `_render_loss_for_sample` for the GT.
-            pred_gaussians["position"] = _build_world_positions(
-                sample, pred_gaussians["offset"], cfg["data"]["base_voxel_size"], device,
+    # ---- L_occ 占位损失计算 ----
+    l_occ = torch.tensor(0.0, device=device)
+    if occ_list:
+        for stage_idx, occ in enumerate(occ_list):
+            occ_feat = occ.F  # (M, 1)
+            # 此时真值可以直接对应当前激活特征覆盖范围（全 1 监督掩码）
+            targets = torch.ones(occ_feat.shape[0], device=device)
+            l_occ = l_occ + torch.nn.functional.binary_cross_entropy_with_logits(
+                occ_feat.squeeze(-1), targets
             )
-        if lambda_rgb > 0 or lambda_perc > 0:
-            l_rgb, l_perc = _render_loss_for_sample(
-                sample, pred_gaussians, gaussians, cfg, device,
-                perceptual=perceptual, rng=rng,
+        l_occ = l_occ / len(occ_list)
+
+    # ---- L_LFQ 量化离散损失 ----
+    l_lfq = torch.nn.functional.softplus(lfq_loss + 5.0)
+
+    # ---- L_RGB / L_perc 渲染损失（前向并行，渲染串行） ----
+    l_rgb = torch.tensor(0.0, device=device)
+    l_perc = torch.tensor(0.0, device=device)
+    
+    if lambda_rgb > 0 or lambda_perc > 0:
+        # 由于每个场景块有自己独立的相机视角，渲染必须通过 batch_index 拆开分别渲染
+        batch_indices = coords[:, 0]  # 提取第 0 列的 batch 标签
+        unique_b_ids = torch.unique(batch_indices)
+        
+        for b_id in unique_b_ids:
+            mask = (batch_indices == b_id)
+            
+            # 剥离出当前单样本的预测值与真值
+            sample_pred = {k: v[mask] for k, v in pred_gaussians.items()}
+            sample_gt = {k: v[mask] for k, v in gaussians.items()}
+            
+            # 重新组装元数据供渲染器定位
+            meta_idx = int(b_id.item())
+            meta_sample = {
+                "voxel_coords": coords[mask, 1:4],  # 去掉开头的 batch 维，还原成 3D 坐标
+                "chunk_origin": torch.tensor(batch["metas"][meta_idx]["chunk_min_voxel"], device=device)
+            }
+            
+            # 复用原版的单视图渲染损失函数
+            # 注意：传入单样本的相机或场景参数，可以从 batch["metas"][meta_idx] 中灵活读取
+            single_rgb, single_perc = _render_loss_for_sample(
+                meta_sample, sample_pred, sample_gt, cfg, device,
+                perceptual=perceptual, rng=rng
             )
-        else:
-            l_rgb = torch.zeros((), device=device)
-            l_perc = torch.zeros((), device=device)
+            l_rgb = l_rgb + single_rgb / len(unique_b_ids)
+            l_perc = l_perc + single_perc / len(unique_b_ids)
 
-        # GaussianGPT Eq. (1): the LFQ entropy term is wrapped in
-        #     λ_LFQ · softplus(L_LFQ + 5)
-        # The purpose of the offset + softplus is purely cosmetic --- it
-        # keeps the displayed loss positive (since L_LFQ ∈ [−log 2, +log 2]
-        # can dip below zero) without meaningfully changing the gradient
-        # (sigmoid(L_LFQ + 5) ≈ 1 throughout the operating range).
-        l_lfq = torch.nn.functional.softplus(lfq_loss + 5.0)
+    # 4. 综合总 Loss
+    total_loss = (
+        lambda_rgb * l_rgb
+        + lambda_perc * l_perc
+        + lambda_occ * l_occ
+        + lambda_lfq * l_lfq
+    )
 
-        sample_loss = (
-            lambda_rgb * l_rgb
-            + lambda_perc * l_perc
-            + lambda_occ * l_occ
-            + lambda_lfq * l_lfq
-        ) / n
+    if backward:
+        total_loss.backward()
 
-        if backward:
-            sample_loss.backward()
-
-        batch_loss = batch_loss + sample_loss.detach()
-        batch_occ += l_occ.item() / n
-        # Log the actual term that enters the loss (softplus-wrapped), so
-        # the printed value matches the gradient that backprops.
-        batch_lfq += l_lfq.item() / n
-        batch_rgb += float(l_rgb.detach().item()) / n
-        batch_perc += float(l_perc.detach().item()) / n
-
-    return batch_loss, batch_occ, batch_lfq, batch_rgb, batch_perc
-
+    return (
+        total_loss, 
+        l_occ.item(), 
+        l_lfq.item(), 
+        float(l_rgb.detach().item()), 
+        float(l_perc.detach().item())
+    )
 
 def save_gaussians_as_ply(gaussians: dict, path: str):
     """Write reconstructed Gaussians as a 3DGS-compatible Binary PLY file.
@@ -579,43 +675,73 @@ def train(cfg: dict, args):
         model = nn.DataParallel(model)
 
     # Dataset
-    data_dir = args.data_dir or cfg["data"]["data_dir"]
-    train_dataset = GaussianSceneDataset(
-        data_dir=data_dir,
-        base_voxel_size=cfg["data"]["base_voxel_size"],
-        n_down=cfg["model"]["n_down"],
-        chunk_size=tuple(cfg["data"]["chunk_size"]),
-        min_occupancy=cfg["data"].get("min_occupancy_ae", 0.2),
-        augment=(not no_augment),
-        split="train",
-        fixed_chunk=fixed_chunk,
-        voxel_dedup=voxel_dedup,
+    from gaussiangpt.autoencoder.data_preprocess.dataset import ASEChunkDataset
+    from gaussiangpt.autoencoder.data_preprocess.collect import ase_sparse_collate
+    train_dataset = ASEChunkDataset(
+        cache_root=cfg["data"]["cache_root"],  # 指向你的离线 .npz 缓存目录
+        num_samples_per_epoch=1000,
+        chunk_size=4.0,                        # 对应你的物理或体素切块配置
+        occupancy_threshold=0.2
     )
-    val_dataset = GaussianSceneDataset(
-        data_dir=data_dir,
-        base_voxel_size=cfg["data"]["base_voxel_size"],
-        n_down=cfg["model"]["n_down"],
-        chunk_size=tuple(cfg["data"]["chunk_size"]),
-        min_occupancy=cfg["data"].get("min_occupancy_ae", 0.2),
-        augment=False,
-        split="val",
-        # Validation always uses deterministic chunks; voxel dedup tracks
-        # the train setting so the GT representation stays consistent.
-        fixed_chunk=fixed_chunk,
-        voxel_dedup=voxel_dedup,
+    
+    # 替换验证集实例化（可以共享同一个类，指定不同的场景 id 列表）
+    val_dataset = ASEChunkDataset(
+        cache_root=cfg["data"]["cache_root"],
+        num_samples_per_epoch=200,
+        chunk_size=4.0,
+        occupancy_threshold=0.2
     )
 
     batch_size = args.batch_size or cfg["training"]["batch_size"]
+    
+    # 关键：将 collate_fn 替换为你写的真正的并行化组装函数 ase_sparse_collate
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=4, pin_memory=False, drop_last=True,
-        collate_fn=sparse_collate,
+        collate_fn=ase_sparse_collate,  # 替换这里！
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
         num_workers=2, pin_memory=False,
-        collate_fn=sparse_collate,
+        collate_fn=ase_sparse_collate,  # 替换这里！
     )
+    # data_dir = args.data_dir or cfg["data"]["data_dir"]
+    # train_dataset = GaussianSceneDataset(
+    #     data_dir=data_dir,
+    #     base_voxel_size=cfg["data"]["base_voxel_size"],
+    #     n_down=cfg["model"]["n_down"],
+    #     chunk_size=tuple(cfg["data"]["chunk_size"]),
+    #     min_occupancy=cfg["data"].get("min_occupancy_ae", 0.2),
+    #     augment=(not no_augment),
+    #     split="train",
+    #     fixed_chunk=fixed_chunk,
+    #     voxel_dedup=voxel_dedup,
+    # )
+    # val_dataset = GaussianSceneDataset(
+    #     data_dir=data_dir,
+    #     base_voxel_size=cfg["data"]["base_voxel_size"],
+    #     n_down=cfg["model"]["n_down"],
+    #     chunk_size=tuple(cfg["data"]["chunk_size"]),
+    #     min_occupancy=cfg["data"].get("min_occupancy_ae", 0.2),
+    #     augment=False,
+    #     split="val",
+    #     # Validation always uses deterministic chunks; voxel dedup tracks
+    #     # the train setting so the GT representation stays consistent.
+    #     fixed_chunk=fixed_chunk,
+    #     voxel_dedup=voxel_dedup,
+    # )
+
+    # batch_size = args.batch_size or cfg["training"]["batch_size"]
+    # train_loader = DataLoader(
+    #     train_dataset, batch_size=batch_size, shuffle=True,
+    #     num_workers=4, pin_memory=False, drop_last=True,
+    #     collate_fn=sparse_collate,
+    # )
+    # val_loader = DataLoader(
+    #     val_dataset, batch_size=batch_size, shuffle=False,
+    #     num_workers=2, pin_memory=False,
+    #     collate_fn=sparse_collate,
+    # )
 
     # Optimizer
     lr = args.lr or cfg["training"]["lr"]
