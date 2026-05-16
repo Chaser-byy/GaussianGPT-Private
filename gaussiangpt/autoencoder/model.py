@@ -151,6 +151,7 @@ class GaussianAutoencoder(nn.Module):
             )
             decoded_sparse, occ_list = self.decoder(z_q_sparse)
             decoded_feat = decoded_sparse.F  # (N_latent, in_ch)
+            decoded_coords = decoded_sparse.C.long()
         else:
             # Dense fallback: place z_q back in grid, decode, read at voxel positions
             num_bits = z_q.shape[-1]
@@ -159,7 +160,10 @@ class GaussianAutoencoder(nn.Module):
             z_q_grid[0, :, latent_vc[:, 0], latent_vc[:, 1], latent_vc[:, 2]] = z_q.T
             decoded_grid, occ_list = self.decoder(z_q_grid)  # (1, in_ch, gx, gy, gz)
             decoded_feat = decoded_grid[0, :, vc[:, 0], vc[:, 1], vc[:, 2]].T  # (N, in_ch)
+            batch_idx = torch.zeros(vc.shape[0], 1, dtype=torch.long, device=vc.device)
+            decoded_coords = torch.cat([batch_idx, vc.long()], dim=1)
 
         # Step 5: decode features back to Gaussian attributes
         pred_gaussians = self.attr_decoder(decoded_feat)
+        pred_gaussians["_coords"] = decoded_coords
         return pred_gaussians, occ_list, lfq_loss, indices

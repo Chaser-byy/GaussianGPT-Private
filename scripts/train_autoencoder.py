@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--val_every_steps", type=int, default=None)
+    parser.add_argument("--cache_root", type=str, default=None)
     return parser.parse_args()
 
 
@@ -117,8 +118,12 @@ def _render_loss_for_sample(
     gt_position = _build_world_positions(
         sample, gt_gaussians["offset"].detach(), base_voxel_size, device
     )
+    pred_sample = sample
+    if "pred_voxel_coords" in sample:
+        pred_sample = dict(sample)
+        pred_sample["voxel_coords"] = sample["pred_voxel_coords"]
     pred_position = _build_world_positions(
-        sample, pred_gaussians["offset"], base_voxel_size, device
+        pred_sample, pred_gaussians["offset"], base_voxel_size, device
     )
 
     # Camera sphere is sized from the GT bbox so the views naturally cover
@@ -292,6 +297,8 @@ def compute_batch_loss(
     perceptual: nn.Module = None,
     rng: torch.Generator = None,
 ):
+    from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
+
     loss_cfg = cfg.get("loss", {})
     lambda_rgb = float(loss_cfg.get("lambda_rgb", 0.0))
     lambda_perc = float(loss_cfg.get("lambda_perc", 0.0))
@@ -301,6 +308,12 @@ def compute_batch_loss(
     # 1. 提取全批次拼接后的 4D 坐标与 14D 原始高斯特征
     coords = batch["coords"].to(device)       # 形状: (N_total, 4) -> [b, x, y, z]
     feats = batch["feats"].to(device)         # 形状: (N_total, 14)
+    if not HAS_MINKOWSKI and coords.shape[1] == 4:
+        raise RuntimeError(
+            "The ASE dataloader produces batched sparse coordinates and requires "
+            "MinkowskiEngine. Dense fallback only supports the legacy single-sample "
+            "3D-coordinate path."
+        )
     
     # 2. 核心衔接机制：将 14 维扁平特征解包切片，对齐师兄原模型 heads 期待的输入字典
     gaussians = {
@@ -313,6 +326,9 @@ def compute_batch_loss(
 
     # 3. 彻底告别 for 循环！整个 Batch 放入 Sparse CNN 一把梭完成前向推理
     pred_gaussians, occ_list, lfq_loss, indices = raw_model(gaussians, coords)
+    pred_coords = pred_gaussians.pop("_coords", None)
+    if pred_coords is None:
+        pred_coords = coords
 
     # ---- L_occ 占位损失计算 ----
     l_occ = torch.tensor(0.0, device=device)
@@ -335,20 +351,25 @@ def compute_batch_loss(
     
     if lambda_rgb > 0 or lambda_perc > 0:
         # 由于每个场景块有自己独立的相机视角，渲染必须通过 batch_index 拆开分别渲染
-        batch_indices = coords[:, 0]  # 提取第 0 列的 batch 标签
-        unique_b_ids = torch.unique(batch_indices)
-        
-        for b_id in unique_b_ids:
-            mask = (batch_indices == b_id)
+        gt_batch_indices = coords[:, 0]  # 提取第 0 列的 batch 标签
+        pred_batch_indices = pred_coords[:, 0]
+
+        render_count = 0
+        for meta_idx, _meta in enumerate(batch["metas"]):
+            gt_mask = gt_batch_indices == meta_idx
+            pred_mask = pred_batch_indices == meta_idx
+            if not bool(gt_mask.any()) or not bool(pred_mask.any()):
+                continue
+            render_count += 1
             
             # 剥离出当前单样本的预测值与真值
-            sample_pred = {k: v[mask] for k, v in pred_gaussians.items()}
-            sample_gt = {k: v[mask] for k, v in gaussians.items()}
+            sample_pred = {k: v[pred_mask] for k, v in pred_gaussians.items()}
+            sample_gt = {k: v[gt_mask] for k, v in gaussians.items()}
             
             # 重新组装元数据供渲染器定位
-            meta_idx = int(b_id.item())
             meta_sample = {
-                "voxel_coords": coords[mask, 1:4],  # 去掉开头的 batch 维，还原成 3D 坐标
+                "voxel_coords": coords[gt_mask, 1:4],  # 去掉开头的 batch 维，还原成 3D 坐标
+                "pred_voxel_coords": pred_coords[pred_mask, 1:4],
                 "chunk_origin": torch.tensor(batch["metas"][meta_idx]["chunk_min_voxel"], device=device)
             }
             
@@ -358,8 +379,11 @@ def compute_batch_loss(
                 meta_sample, sample_pred, sample_gt, cfg, device,
                 perceptual=perceptual, rng=rng
             )
-            l_rgb = l_rgb + single_rgb / len(unique_b_ids)
-            l_perc = l_perc + single_perc / len(unique_b_ids)
+            l_rgb = l_rgb + single_rgb
+            l_perc = l_perc + single_perc
+        if render_count > 0:
+            l_rgb = l_rgb / render_count
+            l_perc = l_perc / render_count
 
     # 4. 综合总 Loss
     total_loss = (
@@ -379,6 +403,32 @@ def compute_batch_loss(
         float(l_rgb.detach().item()), 
         float(l_perc.detach().item())
     )
+
+
+def ase_batch_sample_to_legacy_sample(batch: dict, sample_index: int = 0) -> dict:
+    """Extract one collated ASE sample in the legacy per-sample format.
+
+    Validation reconstruction still runs through the older single-sample helper,
+    so this keeps that path isolated from the batched training representation.
+    """
+    coords = batch["coords"]
+    feats = batch.get("target_feats", batch["feats"])
+    mask = coords[:, 0] == int(sample_index)
+    if not bool(mask.any()):
+        raise ValueError(f"ASE batch does not contain sample_index={sample_index}")
+
+    sample_feats = feats[mask]
+    meta = batch["metas"][sample_index]
+    return {
+        "voxel_coords": coords[mask, 1:4],
+        "chunk_origin": torch.as_tensor(meta["chunk_min_voxel"], dtype=torch.long),
+        "offset": sample_feats[:, 0:3],
+        "color": sample_feats[:, 3:6],
+        "opacity": sample_feats[:, 6:7],
+        "scale": sample_feats[:, 7:10],
+        "rotation": sample_feats[:, 10:14],
+        "metadata": meta,
+    }
 
 def save_gaussians_as_ply(gaussians: dict, path: str):
     """Write reconstructed Gaussians as a 3DGS-compatible Binary PLY file.
@@ -503,10 +553,15 @@ def save_validation_reconstruction(
                  if k in ("offset", "scale", "opacity", "rotation", "color", "sh")}
 
     pred_gaussians, _, _, _ = raw_model(gaussians, voxel_coords)
+    pred_coords = pred_gaussians.pop("_coords", None)
+    if pred_coords is not None:
+        pred_voxel_coords = pred_coords[:, 1:] if pred_coords.shape[1] == 4 else pred_coords
+    else:
+        pred_voxel_coords = voxel_coords
     base_voxel_size = float(cfg["data"]["base_voxel_size"])
-    abs_voxel_coords = voxel_coords + chunk_origin
-    voxel_centers = (abs_voxel_coords.to(pred_gaussians["offset"].dtype) + 0.5) * base_voxel_size
-    pred_gaussians["position"] = voxel_centers + pred_gaussians["offset"]
+    pred_abs_voxel_coords = pred_voxel_coords + chunk_origin
+    pred_voxel_centers = (pred_abs_voxel_coords.to(pred_gaussians["offset"].dtype) + 0.5) * base_voxel_size
+    pred_gaussians["position"] = pred_voxel_centers + pred_gaussians["offset"]
     save_gaussians_as_ply(pred_gaussians, ply_path)
 
     # ---- Optional: render GT vs. Pred views and save as a side-by-side PNG ----
@@ -519,6 +574,8 @@ def save_validation_reconstruction(
     if n_views <= 0:
         return
 
+    abs_voxel_coords = voxel_coords + chunk_origin
+    voxel_centers = (abs_voxel_coords.to(gaussians["offset"].dtype) + 0.5) * base_voxel_size
     gt_position = voxel_centers + gaussians["offset"]
     bbox_min = gt_position.min(dim=0).values
     bbox_max = gt_position.max(dim=0).values
@@ -595,10 +652,10 @@ def validate(
     val_rng = torch.Generator(device=device)
     val_rng.manual_seed(int(global_step))
     with torch.no_grad():
-        for batch_list in val_loader:
+        for batch in val_loader:
             (batch_loss, batch_occ, batch_lfq,
              batch_rgb, batch_perc) = compute_batch_loss(
-                raw_model, batch_list, cfg, device, backward=False,
+                raw_model, batch, cfg, device, backward=False,
                 perceptual=perceptual, rng=val_rng,
             )
             total_loss += batch_loss.item()
@@ -606,9 +663,9 @@ def validate(
             total_lfq += batch_lfq
             total_rgb += batch_rgb
             total_perc += batch_perc
-            if not saved_reconstruction and batch_list:
+            if not saved_reconstruction and batch["coords"].numel() > 0:
                 save_validation_reconstruction(
-                    raw_model, batch_list[0], cfg, device,
+                    raw_model, ase_batch_sample_to_legacy_sample(batch, 0), cfg, device,
                     ply_path=recon_path, image_path=image_path,
                 )
                 saved_reconstruction = True
@@ -676,20 +733,54 @@ def train(cfg: dict, args):
 
     # Dataset
     from gaussiangpt.autoencoder.data_preprocess.dataset import ASEChunkDataset
-    from gaussiangpt.autoencoder.data_preprocess.collect import ase_sparse_collate
+    from gaussiangpt.autoencoder.data_preprocess.collate import ase_sparse_collate
+    data_cfg = cfg["data"]
+    cache_root = args.cache_root or data_cfg.get("cache_root") or args.data_dir
+    if not cache_root:
+        raise ValueError(
+            "ASE dataloader requires data.cache_root or --cache_root "
+            "(--data_dir is also accepted as a compatibility fallback)."
+        )
+    base_voxel_size = float(data_cfg["base_voxel_size"])
+    chunk_size_voxels = tuple(data_cfg.get("chunk_size", [160, 160, 160]))
+    chunk_size_world = float(
+        data_cfg.get("ase_chunk_size", chunk_size_voxels[0] * base_voxel_size)
+    )
+    train_samples_per_epoch = int(data_cfg.get("train_samples_per_epoch", 1000))
+    val_samples_per_epoch = int(data_cfg.get("val_samples_per_epoch", 200))
+    occupancy_threshold = float(data_cfg.get("min_occupancy_ae", 0.2))
+    max_candidate_chunks = int(data_cfg.get("max_candidate_chunks", 10))
+    top_k_cameras = int(data_cfg.get("top_k_cameras", 12))
+    z_mode = str(data_cfg.get("z_mode", "fixed_160"))
+    preferred_coverage = float(data_cfg.get("preferred_coverage", 0.4))
+    train_scene_ids = data_cfg.get("train_scene_ids")
+    val_scene_ids = data_cfg.get("val_scene_ids")
+
     train_dataset = ASEChunkDataset(
-        cache_root=cfg["data"]["cache_root"],  # 指向你的离线 .npz 缓存目录
-        num_samples_per_epoch=1000,
-        chunk_size=4.0,                        # 对应你的物理或体素切块配置
-        occupancy_threshold=0.2
+        cache_root=cache_root,
+        num_samples_per_epoch=train_samples_per_epoch,
+        chunk_size=chunk_size_world,
+        occupancy_threshold=occupancy_threshold,
+        max_candidate_chunks=max_candidate_chunks,
+        top_k_cameras=top_k_cameras,
+        seed=int(data_cfg.get("seed", 42)),
+        z_mode=z_mode,
+        preferred_coverage=preferred_coverage,
+        scene_ids=train_scene_ids,
     )
     
     # 替换验证集实例化（可以共享同一个类，指定不同的场景 id 列表）
     val_dataset = ASEChunkDataset(
-        cache_root=cfg["data"]["cache_root"],
-        num_samples_per_epoch=200,
-        chunk_size=4.0,
-        occupancy_threshold=0.2
+        cache_root=cache_root,
+        num_samples_per_epoch=val_samples_per_epoch,
+        chunk_size=chunk_size_world,
+        occupancy_threshold=occupancy_threshold,
+        max_candidate_chunks=max_candidate_chunks,
+        top_k_cameras=top_k_cameras,
+        seed=int(data_cfg.get("val_seed", 4242)),
+        z_mode=z_mode,
+        preferred_coverage=preferred_coverage,
+        scene_ids=val_scene_ids,
     )
 
     batch_size = args.batch_size or cfg["training"]["batch_size"]
@@ -697,12 +788,15 @@ def train(cfg: dict, args):
     # 关键：将 collate_fn 替换为你写的真正的并行化组装函数 ase_sparse_collate
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=4, pin_memory=False, drop_last=True,
+        num_workers=int(data_cfg.get("num_workers", 4)),
+        pin_memory=bool(data_cfg.get("pin_memory", False)),
+        drop_last=True,
         collate_fn=ase_sparse_collate,  # 替换这里！
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=2, pin_memory=False,
+        num_workers=int(data_cfg.get("val_num_workers", 2)),
+        pin_memory=bool(data_cfg.get("pin_memory", False)),
         collate_fn=ase_sparse_collate,  # 替换这里！
     )
     # data_dir = args.data_dir or cfg["data"]["data_dir"]

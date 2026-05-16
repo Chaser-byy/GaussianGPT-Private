@@ -10,8 +10,8 @@ from typing import Optional, Union
 
 import numpy as np
 
-from ply_io import get_gaussian_ply_num_vertices, read_gaussian_ply
-from schema import GaussianScene
+from .ply_io import get_gaussian_ply_num_vertices, read_gaussian_ply
+from .schema import GaussianScene
 
 
 @dataclass

@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from gaussiangpt_ae.data.voxelize import build_ase_voxel_cache
+from gaussiangpt.autoencoder.data_preprocess.voxelize import build_ase_voxel_cache
 
 
 def main() -> None:

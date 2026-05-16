@@ -12,9 +12,19 @@ model:
 
 data:
   data_dir: "/home/chengtianle/GaussianGPT/data/overfit"
+  cache_root: null                  # ASE voxel cache root; can also pass --cache_root
   base_voxel_size: 0.025          # 2.5 cm
   chunk_size: [256, 256, 256]     # base voxels; latent chunk = 32^3 (transformer seq ~ 32k)
   min_occupancy_ae: 0.2
+  train_samples_per_epoch: 1000
+  val_samples_per_epoch: 200
+  max_candidate_chunks: 10
+  top_k_cameras: 12
+  z_mode: "fixed_160"
+  preferred_coverage: 0.4
+  num_workers: 4
+  val_num_workers: 2
+  pin_memory: false
 
 # GaussianGPT Eq. (1):
 #   L = lambda_rgb  * L1(renderings)            # L3DG L_RGB

@@ -8,7 +8,7 @@ from typing import Optional, Union
 import numpy as np
 from plyfile import PlyData
 
-from schema import (
+from .schema import (
     GaussianScene,
     compute_gaussian_scene_stats as compute_gaussian_scene_stats,
     validate_gaussian_scene,

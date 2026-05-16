@@ -7,8 +7,8 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 
-from ase import ASECameras, load_ase_camera_cache
-from voxelize import load_ase_voxel_cache
+from .ase import ASECameras, load_ase_camera_cache
+from .voxelize import load_ase_voxel_cache
 
 
 def _bbox_corners(chunk_world_min: np.ndarray, chunk_world_max: np.ndarray) -> np.ndarray:
@@ -298,6 +298,15 @@ class ASEOnlineChunkSampler:
         )
         self._scene_cache: Dict[str, Dict] = {str(self.scene_cache_paths[0]): first_cache}
         self._camera_cache: Dict[str, object] = {}
+
+    def set_seed(self, seed: int) -> None:
+        """Reset the sampler RNG.
+
+        DataLoader workers inherit the parent process state under fork, so each
+        worker must get its own RNG stream before online chunk sampling starts.
+        """
+        self.seed = int(seed)
+        self.rng = np.random.RandomState(self.seed)
 
     def _load_scene_cache(self, path: Path) -> Dict:
         key = str(path)

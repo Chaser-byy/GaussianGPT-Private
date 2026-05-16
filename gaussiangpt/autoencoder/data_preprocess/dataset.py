@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-from sampler import ASEOnlineChunkSampler
+from .sampler import ASEOnlineChunkSampler
 
 
 class ASEChunkDataset:
@@ -25,6 +25,7 @@ class ASEChunkDataset:
         scene_ids: Optional[List[str]] = None,
     ) -> None:
         self.num_samples_per_epoch = int(num_samples_per_epoch)
+        self._worker_seed: Optional[int] = None
         self.sampler = ASEOnlineChunkSampler(
             cache_root=cache_root,
             chunk_size=chunk_size,
@@ -40,8 +41,24 @@ class ASEChunkDataset:
     def __len__(self) -> int:
         return self.num_samples_per_epoch
 
+    def _maybe_seed_worker(self) -> None:
+        try:
+            from torch.utils.data import get_worker_info
+        except ImportError:
+            return
+
+        worker_info = get_worker_info()
+        if worker_info is None:
+            return
+
+        worker_seed = int(worker_info.seed % (2**32))
+        if self._worker_seed != worker_seed:
+            self.sampler.set_seed(worker_seed)
+            self._worker_seed = worker_seed
+
     def __getitem__(self, idx: int) -> Dict:
         del idx
+        self._maybe_seed_worker()
         sample = self.sampler.sample()
         sample["metadata"] = {
             "scene_id": sample["scene_id"],

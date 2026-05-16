@@ -8,13 +8,13 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 
-from ase import (
+from .ase import (
     discover_ase_scenes,
     load_ase_scene_gaussians,
     read_ase_cameras,
     save_ase_camera_cache,
 )
-from schema import GaussianScene, validate_gaussian_scene
+from .schema import GaussianScene, validate_gaussian_scene
 
 SH_C0 = 0.28209479177387814
 DEFAULT_FEATURE_SCALES = {
