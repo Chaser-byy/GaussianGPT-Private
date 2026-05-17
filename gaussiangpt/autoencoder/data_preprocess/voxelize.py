@@ -95,11 +95,6 @@ def _feature_scales(feature_scales: Dict = None) -> Dict:
     return scales
 
 
-def _stable_softplus_numpy(value: np.ndarray) -> np.ndarray:
-    value = np.asarray(value, dtype=np.float32)
-    return (np.log1p(np.exp(-np.abs(value))) + np.maximum(value, 0.0)).astype(np.float32)
-
-
 def encode_gaussian_features_for_ae(
     relative_xyz: np.ndarray,
     color_raw: np.ndarray,
@@ -121,7 +116,11 @@ def encode_gaussian_features_for_ae(
     opacity = np.clip(np.asarray(opacity_raw, dtype=np.float32), -10.0, 10.0)
     opacity = opacity.astype(np.float32) * float(scales["opacity"])
 
-    scale = _stable_softplus_numpy(np.asarray(scale_raw, dtype=np.float32))
+    # Standard 3DGS PLY files store scale_* in log-space. GaussianGPT's AE
+    # trains on positive world-space sizes, while the decoder predicts those
+    # positive sizes via softplus. Therefore PLY input is decoded with exp()
+    # here; softplus belongs on the model output side, not on the PLY reader.
+    scale = np.exp(np.asarray(scale_raw, dtype=np.float32))
     scale = np.maximum(scale, 1e-8).astype(np.float32) * float(scales["scale"])
 
     quat = np.asarray(rotation_raw, dtype=np.float32)
@@ -314,10 +313,10 @@ def build_ase_voxel_cache(
                 "num_input_gaussians": int(scene.xyz.shape[0]),
                 "num_voxels": int(voxel_features["coords"].shape[0]),
                 "voxel_size": float(voxel_size),
-                "feature_representation": "gaussiangpt_ae_v1_softplus_scale",
+                "feature_representation": "gaussiangpt_ae_v1_exp_ply_scale",
                 "color_representation": "rgb_from_sh_dc_clamped_0_1",
                 "opacity_representation": "logit_clamped_-10_10",
-                "scale_representation": "world_size_from_softplus_raw_scale",
+                "scale_representation": "world_size_from_exp_ply_log_scale",
                 "rotation_representation": "unit_quaternion_w_positive",
                 "offset_representation": "world_offset_from_voxel_center",
                 "feature_scales": dict(DEFAULT_FEATURE_SCALES),
