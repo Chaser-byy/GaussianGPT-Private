@@ -1,0 +1,82 @@
+# Autoencoder configuration for single-chunk overfitting.
+
+model:
+  base_ch: 128
+  n_down: 3
+  codebook_size: 16384
+  use_sh: false
+
+data:
+  data_dir: "/home/chengtianle/GaussianGPT/data/overfit"
+  cache_root: "/root/autodl-tmp/GaussianGPT-Private/data/ae_ase_cache"
+  base_voxel_size: 0.025
+  chunk_size: [256, 256, 256]
+
+  # 单 chunk 过拟合：epoch 内反复看同一个固定 chunk。
+  train_samples_per_epoch: 1000
+  val_samples_per_epoch: 1
+
+  min_occupancy_ae: 0.2
+  max_candidate_chunks: 50
+  top_k_cameras: 12
+  z_mode: "fixed_160"
+  preferred_coverage: 0.4
+
+  # 单 chunk 调试建议关掉多 worker，避免 worker seed / sampler 状态引入差异。
+  num_workers: 0
+  val_num_workers: 0
+  pin_memory: false
+
+  # 如果 overfit cache 里不止一个 scene，建议显式填同一个 scene id：
+  # train_scene_ids: ["00000"]
+  # val_scene_ids: ["00000"]
+  train_scene_ids: null
+  val_scene_ids: null
+
+  # train / val 使用同 seed，配合 fixed_chunk 时应取到同一个 chunk。
+  seed: 42
+  val_seed: 42
+
+loss:
+  lambda_rgb: 5
+  lambda_perc: 1.0
+  lambda_occ: 1.0
+  lambda_lfq: 0.1
+
+  n_images: 12
+  render_size: 512
+  vgg19_weights_path: "/root/autodl-tmp/GaussianGPT-Private/vgg19-dcbb9e9d.pth"
+
+  fov_deg: 60.0
+  radius_factor: 1.5
+  upper_hemisphere_only: false
+
+  # 单 chunk 过拟合时建议先关 jitter，让 render target 也固定。
+  camera_jitter: 0.0
+
+training:
+  epochs: 6000
+  batch_size: 1
+  lr: 1.0e-4
+  lr_min_ratio: 0.1
+  save_every: 1500
+  val_every_steps: 1000
+
+diagnostics:
+  color_check_every: 100
+
+debug:
+  norm: "instance"
+  color_activation: "sigmoid"
+
+  # 关键：固定同一个 chunk。
+  fixed_chunk: true
+
+  # 单 chunk 过拟合时先关 augmentation，确认模型能吃死静态目标。
+  no_augment: true
+
+  # 避免同 voxel 多 Gaussian 随机 survivor 导致 GT 抖动。
+  voxel_dedup: "nearest"
+
+  grad_clip: 1000.0
+  log_grad_norm_every: 20

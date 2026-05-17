@@ -1,0 +1,132 @@
+# Autoencoder configuration for scene training (L3DG-style; rooms).
+# Paper: base voxel 2.5cm, 3 downsampling stages -> 20cm latent voxels
+
+model:
+  base_ch: 128           # Per L3DG Sec. 3.4 doubling rule: [128, 256, 512, 1024]
+                         # (bottleneck 1024 because GaussianGPT scene cfg uses n_down=3)
+  n_down: 3              # 3 downsampling stages: 2.5cm -> 5cm -> 10cm -> 20cm
+  codebook_size: 16384    # 2^12 = 4096 (12-bit LFQ)
+  use_sh: false          # No view-dependent appearance for scenes
+  # Note: GaussianGPT Appendix C predicts offsets as unbounded world-space
+  # values (no L3DG-style tanh clamping), and scales via softplus.
+
+data:
+  data_dir: "/home/chengtianle/GaussianGPT/data/overfit"
+  cache_root: null                  # ASE voxel cache root; can also pass --cache_root
+  base_voxel_size: 0.025          # 2.5 cm
+  chunk_size: [256, 256, 256]     # base voxels; latent chunk = 32^3 (transformer seq ~ 32k)
+  min_occupancy_ae: 0.2
+  train_samples_per_epoch: 1000
+  val_samples_per_epoch: 200
+  max_candidate_chunks: 10
+  top_k_cameras: 12
+  z_mode: "fixed_160"
+  preferred_coverage: 0.4
+  num_workers: 4
+  val_num_workers: 2
+  pin_memory: false
+
+# GaussianGPT Eq. (1):
+#   L = lambda_rgb  * L1(renderings)            # L3DG L_RGB
+#     + lambda_perc * VGG19(renderings)         # L3DG L_perc
+#     + lambda_occ  * BCE(occupancy)            # L3DG L_occ
+#     + lambda_lfq  * softplus(L_LFQ + 5)       # LFQ codebook entropy
+loss:
+  lambda_rgb: 1.0           # GaussianGPT Sec. 4.2 room hyperparam
+  lambda_perc: 0          # GaussianGPT Sec. 4.2 room hyperparam
+  lambda_occ: 1.0
+  lambda_lfq: 0.1
+  n_images: 1             # M = 12 random viewpoints per scene per step (L3DG room)
+  render_size: 512          # square image side; lower for speed if VRAM bound
+  vgg19_weights_path: "/home/chengtianle/GaussianGPT/checkpoints/vgg19-dcbb9e9d.pth"
+  fov_deg: 60.0             # camera horizontal/vertical FOV
+  radius_factor: 1.5        # camera distance = 1.5 · half-bbox-diagonal
+  upper_hemisphere_only: false
+  camera_jitter: 0.05       # small unit-vector perturbation on each spherical sample
+
+training:
+  epochs: 6000
+  batch_size: 4             # paper: effective 8 with 4 GPUs
+  lr: 1.0e-4
+  lr_min_ratio: 0.1         # cosine decay floor
+  save_every: 1500
+  val_every_steps: 6000     # 0 disables in-training validation
+
+# Optional sanity checks logged during training. The colour-clamp check
+# detects the dead-gradient pathology of `clamp(0,1)` on the colour head:
+# rising `frac_dead` or shrinking `gnorm(color/scale)` ratio = trouble.
+# Set color_check_every to 0 to disable.
+diagnostics:
+  color_check_every: 600    # global-steps between diagnostic prints
+
+# ---------------------------------------------------------------------------
+# Debug toggles. All defaults below match the paper-faithful behaviour, so
+# leaving this block untouched changes nothing. Flip a flag to enable that
+# specific deviation; combine flags freely.
+#
+#   norm:                'bn' (paper) | 'instance' | 'none'
+#                        BatchNorm with batch_size=4 + heterogeneous chunks
+#                        is unstable; 'instance' often trains far better at
+#                        small effective batch sizes.
+#
+#   color_activation:    'clamp' (paper) | 'sigmoid'
+#                        The hard clamp kills gradients on any voxel whose
+#                        pre-clamp colour falls outside [0, 1] (see the
+#                        ColorClampDiagnostics frac_dead readout).
+#
+#   fixed_chunk:         false (paper) | true
+#                        Make the chunk sampler deterministic per scene so
+#                        you can verify the model can actually overfit a
+#                        static target. Strongly recommended when sanity-
+#                        checking on a tiny scene set.
+#
+#   no_augment:          false (paper) | true
+#                        Disable the 8x rotation/reflection augmentation.
+#
+#   voxel_dedup:         'random' (paper) | 'first' | 'nearest'
+#                        Per-voxel survivor when multiple Gaussians fall
+#                        in the same voxel. 'nearest' picks the Gaussian
+#                        whose centre is closest to the voxel centre,
+#                        producing the cleanest GT representation -- the
+#                        paper's Scaffold-GS data is naturally already in
+#                        this state, so this is a useful match for stock
+#                        3DGS PLYs.
+#
+#   grad_clip:           1.0 (paper-ish) | 5.0 / 10.0 / 1e9 to disable
+#                        Total-norm clip after backward(). 1.0 is very
+#                        aggressive when the rasterizer contributes large
+#                        gradients; raise it (or set to 1e9 to disable)
+#                        if `pre_clip_norm` is consistently above 1.0.
+#
+#   log_grad_norm_every: 0 (off) | e.g. 100
+#                        How often (in global steps) to print the
+#                        pre-clip gradient norm.
+
+# debug:
+#   norm: "instance"           # 关键：BN 在 batch=4+异构chunk 下不稳，是 perc 卡住的元凶之一
+#   color_activation: "sigmoid"  # 保持 paper 一致；frac_dead=1% 已经不是问题
+#   fixed_chunk: true          # 真过拟合：让 GT 在迭代间不抖动
+#   no_augment: false          # 保留 8x augmentation（4 scene × 8 = 32 样本，足够多样性）
+#   voxel_dedup: "nearest"     # 关键：消除 GT 颜色的随机性
+#   grad_clip: 1000.0          # 安全网而非瓶颈：3DGS 训练梯度自然在 100~500，clip 设到很高
+#                               #   只在出现 1e5+ 的病态尖刺时熔断，让 Adam 的自适应正常工作
+#   log_grad_norm_every: 8
+
+debug:
+  norm: "instance"           # 关键：BN 在 batch=4+异构chunk 下不稳，是 perc 卡住的元凶之一
+  color_activation: "sigmoid"  # 保持 paper 一致；frac_dead=1% 已经不是问题
+  fixed_chunk: false          # 真过拟合：让 GT 在迭代间不抖动
+  no_augment: false          # 保留 8x augmentation（4 scene × 8 = 32 样本，足够多样性）
+  voxel_dedup: "random"     # 关键：消除 GT 颜色的随机性
+  grad_clip: 1000.0          # 安全网而非瓶颈：3DGS 训练梯度自然在 100~500，clip 设到很高
+                              #   只在出现 1e5+ 的病态尖刺时熔断，让 Adam 的自适应正常工作
+  log_grad_norm_every: 8
+
+# debug:
+#   norm: "bn"
+#   color_activation: "clamp"
+#   fixed_chunk: false
+#   no_augment: false
+#   voxel_dedup: "random"
+#   grad_clip: 50
+#   log_grad_norm_every: 8
