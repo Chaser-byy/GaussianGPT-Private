@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gaussiangpt.autoencoder.data_preprocess.voxelize import build_ase_voxel_cache
 
