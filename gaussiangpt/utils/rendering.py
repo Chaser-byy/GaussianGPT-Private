@@ -151,6 +151,50 @@ def make_camera(
     )
 
 
+def make_camera_from_ase_metadata(
+    camera: Dict,
+    image_height: Optional[int] = None,
+    image_width: Optional[int] = None,
+    device=None,
+    znear: float = 0.01,
+    zfar: float = 100.0,
+) -> MiniCam:
+    """Build a MiniCam from one ASE camera selected for a chunk.
+
+    ASE caches provide COLMAP/3DGS-style world-to-camera matrices where
+    positive camera-space z is in front. The CUDA rasterizer expects the
+    transposed matrix layout used throughout this module.
+    """
+
+    src_width = int(camera["width"])
+    src_height = int(camera["height"])
+    fx = float(camera["fx"])
+    fy = float(camera["fy"])
+    out_width = int(image_width if image_width is not None else src_width)
+    out_height = int(image_height if image_height is not None else src_height)
+    fovx = 2.0 * math.atan(float(src_width) / (2.0 * fx))
+    fovy = 2.0 * math.atan(float(src_height) / (2.0 * fy))
+
+    w2c = torch.as_tensor(camera["w2c"], dtype=torch.float32, device=device)
+    if w2c.shape != (4, 4):
+        raise ValueError(f"ASE camera w2c must have shape (4, 4), got {tuple(w2c.shape)}")
+    w2v_t = w2c.t().contiguous()
+    proj_t = projection_matrix(znear, zfar, fovx, fovy, device=w2v_t.device)
+    full_t = w2v_t @ proj_t
+    cam_center = torch.linalg.inv(w2v_t)[3, :3]
+    return MiniCam(
+        image_height=out_height,
+        image_width=out_width,
+        fovx=float(fovx),
+        fovy=float(fovy),
+        znear=float(znear),
+        zfar=float(zfar),
+        world_view_transform=w2v_t,
+        full_proj_transform=full_t,
+        camera_center=cam_center,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Camera sampling around a scene bounding box.
 # --------------------------------------------------------------------------- #

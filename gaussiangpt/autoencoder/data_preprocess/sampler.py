@@ -44,6 +44,27 @@ def _zero_camera_score(frame: Dict) -> Dict:
     }
 
 
+def _camera_render_payload(cameras: ASECameras, frame: Dict) -> Dict:
+    """Return the camera fields needed by the training-time renderer."""
+
+    c2w = np.asarray(frame.get("c2w", frame.get("transform_matrix")), dtype=np.float32)
+    if frame.get("w2c") is not None:
+        w2c = np.asarray(frame["w2c"], dtype=np.float32)
+    else:
+        w2c = np.linalg.inv(c2w).astype(np.float32)
+    return {
+        "w2c": w2c,
+        "c2w": c2w,
+        "width": int(cameras.width),
+        "height": int(cameras.height),
+        "fx": float(cameras.fx),
+        "fy": float(cameras.fy),
+        "cx": float(cameras.cx),
+        "cy": float(cameras.cy),
+        "pose_convention": cameras.pose_convention,
+    }
+
+
 def score_cameras_for_chunk(
     cameras: ASECameras,
     chunk_world_min: np.ndarray,
@@ -141,6 +162,7 @@ def score_cameras_for_chunk(
                     "frame_index": frame.get("frame_index"),
                     "frame_id": frame.get("frame_id"),
                     "file_path": frame.get("file_path"),
+                    **_camera_render_payload(cameras, frame),
                     "chunk_coverage": chunk_coverage,
                     "image_coverage": image_coverage,
                     "visible_ratio": visible_ratio,

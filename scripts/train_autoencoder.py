@@ -30,6 +30,7 @@ from gaussiangpt.autoencoder.diagnostics import ColorClampDiagnostics
 from gaussiangpt.data import GaussianSceneDataset
 from gaussiangpt.utils.rendering import (
     HAS_RASTERIZER,
+    make_camera_from_ase_metadata,
     sample_cameras_around_bbox,
     render_gaussians,
 )
@@ -93,21 +94,50 @@ def _render_loss_for_sample(
     perceptual: nn.Module = None,
     rng: torch.Generator = None,
 ) -> tuple:
-    """Render N views of GT and predicted Gaussians; return (l_rgb, l_perc).
+    """Render N views of GT and predicted Gaussians.
 
     The GT renderings are detached so the renderer is only used as a fixed
-    photo-realistic supervision signal. Returns scalar tensors on `device`.
+    photo-realistic supervision signal. Returns RGB loss plus optional image
+    batches for a later batch-wide perceptual pass.
     """
     if not HAS_RASTERIZER or device.type != "cuda":
         zero = torch.zeros((), device=device)
-        return zero, zero
+        return zero, None, None
 
     loss_cfg = cfg.get("loss", {})
     n_views = int(loss_cfg.get("n_images", 0))
     img_size = int(loss_cfg.get("render_size", 128))
     if n_views <= 0:
         zero = torch.zeros((), device=device)
-        return zero, zero
+        return zero, None, None
+
+    def _choose_render_cameras():
+        top_cameras = [
+            cam for cam in sample.get("top_cameras", [])
+            if isinstance(cam, dict) and "w2c" in cam
+        ]
+        if top_cameras:
+            n = min(n_views, len(top_cameras))
+            if len(top_cameras) > n:
+                if rng is None:
+                    order = torch.randperm(len(top_cameras), device=device)[:n].tolist()
+                else:
+                    order = torch.randperm(
+                        len(top_cameras), generator=rng, device=device
+                    )[:n].tolist()
+                selected = [top_cameras[i] for i in order]
+            else:
+                selected = top_cameras[:n]
+            return [
+                make_camera_from_ase_metadata(
+                    cam,
+                    image_height=img_size,
+                    image_width=img_size,
+                    device=device,
+                )
+                for cam in selected
+            ]
+        return None
 
     base_voxel_size = float(cfg["data"]["base_voxel_size"])
 
@@ -126,22 +156,26 @@ def _render_loss_for_sample(
         pred_sample, pred_gaussians["offset"], base_voxel_size, device
     )
 
-    # Camera sphere is sized from the GT bbox so the views naturally cover
-    # the scene as it gets reconstructed.
+    # GaussianGPT samples AE cameras conditioned on the selected chunk. For ASE
+    # chunks, the sampler provides cameras selected by projected chunk coverage.
+    # Fall back to synthetic orbit cameras for legacy/smoke data without camera
+    # metadata.
     bbox_min = gt_position.min(dim=0).values.detach()
     bbox_max = gt_position.max(dim=0).values.detach()
-    cameras = sample_cameras_around_bbox(
-        bbox_min=bbox_min,
-        bbox_max=bbox_max,
-        n_views=n_views,
-        image_height=img_size,
-        image_width=img_size,
-        fov_deg=float(loss_cfg.get("fov_deg", 60.0)),
-        radius_factor=float(loss_cfg.get("radius_factor", 1.5)),
-        upper_hemisphere_only=bool(loss_cfg.get("upper_hemisphere_only", False)),
-        jitter=float(loss_cfg.get("camera_jitter", 0.0)),
-        rng=rng,
-    )
+    cameras = _choose_render_cameras()
+    if cameras is None:
+        cameras = sample_cameras_around_bbox(
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+            n_views=n_views,
+            image_height=img_size,
+            image_width=img_size,
+            fov_deg=float(loss_cfg.get("fov_deg", 60.0)),
+            radius_factor=float(loss_cfg.get("radius_factor", 1.5)),
+            upper_hemisphere_only=bool(loss_cfg.get("upper_hemisphere_only", False)),
+            jitter=float(loss_cfg.get("camera_jitter", 0.0)),
+            rng=rng,
+        )
 
     bg = torch.zeros(3, device=device)
     gt_pack = {
@@ -160,25 +194,64 @@ def _render_loss_for_sample(
     }
 
     l_rgb = torch.zeros((), device=device)
-    l_perc = torch.zeros((), device=device)
     perc_buf_pred, perc_buf_gt = [], []
+    need_perc = perceptual is not None and float(loss_cfg.get("lambda_perc", 0.0)) > 0
     for cam in cameras:
         with torch.no_grad():
             img_gt = render_gaussians(gt_pack, cam, bg_color=bg)
         img_pred = render_gaussians(pred_pack, cam, bg_color=bg)
         l_rgb = l_rgb + torch.nn.functional.l1_loss(img_pred, img_gt)
-        if perceptual is not None and float(loss_cfg.get("lambda_perc", 0.0)) > 0:
+        if need_perc:
             perc_buf_pred.append(img_pred)
             perc_buf_gt.append(img_gt)
 
-    l_rgb = l_rgb / float(n_views)
-    if perc_buf_pred:
-        # Stack views into a batch for one VGG call (fewer kernel launches).
-        l_perc = perceptual(
-            torch.stack(perc_buf_pred, dim=0),
-            torch.stack(perc_buf_gt, dim=0),
-        )
-    return l_rgb, l_perc
+    l_rgb = l_rgb / float(max(len(cameras), 1))
+    if not perc_buf_pred:
+        return l_rgb, None, None
+    return l_rgb, torch.stack(perc_buf_pred, dim=0), torch.stack(perc_buf_gt, dim=0)
+
+
+def _batched_grouped_perceptual_loss(
+    perceptual: nn.Module,
+    pred_groups: list,
+    gt_groups: list,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute the old per-sample VGG loss with one batched VGG extraction."""
+
+    if not pred_groups:
+        return torch.zeros((), device=device)
+
+    if not all(hasattr(perceptual, name) for name in ("_normalise", "_extract")):
+        loss = torch.zeros((), device=device)
+        for pred, gt in zip(pred_groups, gt_groups):
+            loss = loss + perceptual(pred, gt)
+        return loss / float(len(pred_groups))
+
+    group_sizes = [int(group.shape[0]) for group in pred_groups]
+    pred = torch.cat(pred_groups, dim=0)
+    gt = torch.cat(gt_groups, dim=0)
+    pred = perceptual._normalise(pred)
+    gt = perceptual._normalise(gt)
+    feats_pred = perceptual._extract(pred)
+    with torch.no_grad():
+        feats_gt = perceptual._extract(gt)
+
+    total = pred.new_zeros(())
+    start = 0
+    for group_size in group_sizes:
+        sample_loss = pred.new_zeros(())
+        end = start + group_size
+        for fp, ft in zip(feats_pred, feats_gt):
+            fp_group = fp[start:end]
+            ft_group = ft[start:end]
+            n = float(fp_group.numel())
+            inv_sqrt_n = 1.0 / (n ** 0.5)
+            sample_loss = sample_loss + ((fp_group - ft_group) * inv_sqrt_n).pow(2).sum()
+        total = total + sample_loss / float(group_size)
+        start = end
+
+    return total / float(len(group_sizes))
 
 
 # def compute_batch_loss(
@@ -348,6 +421,8 @@ def compute_batch_loss(
     # ---- L_RGB / L_perc 渲染损失（前向并行，渲染串行） ----
     l_rgb = torch.tensor(0.0, device=device)
     l_perc = torch.tensor(0.0, device=device)
+    perc_pred_groups = []
+    perc_gt_groups = []
     
     if lambda_rgb > 0 or lambda_perc > 0:
         # 由于每个场景块有自己独立的相机视角，渲染必须通过 batch_index 拆开分别渲染
@@ -370,20 +445,27 @@ def compute_batch_loss(
             meta_sample = {
                 "voxel_coords": coords[gt_mask, 1:4],  # 去掉开头的 batch 维，还原成 3D 坐标
                 "pred_voxel_coords": pred_coords[pred_mask, 1:4],
-                "chunk_origin": torch.tensor(batch["metas"][meta_idx]["chunk_min_voxel"], device=device)
+                "chunk_origin": torch.tensor(batch["metas"][meta_idx]["chunk_min_voxel"], device=device),
+                "top_cameras": batch["metas"][meta_idx].get("top_cameras", []),
+                "camera_debug": batch["metas"][meta_idx].get("camera_debug", {}),
             }
             
             # 复用原版的单视图渲染损失函数
             # 注意：传入单样本的相机或场景参数，可以从 batch["metas"][meta_idx] 中灵活读取
-            single_rgb, single_perc = _render_loss_for_sample(
+            single_rgb, single_perc_pred, single_perc_gt = _render_loss_for_sample(
                 meta_sample, sample_pred, sample_gt, cfg, device,
                 perceptual=perceptual, rng=rng
             )
             l_rgb = l_rgb + single_rgb
-            l_perc = l_perc + single_perc
+            if single_perc_pred is not None and single_perc_gt is not None:
+                perc_pred_groups.append(single_perc_pred)
+                perc_gt_groups.append(single_perc_gt)
         if render_count > 0:
             l_rgb = l_rgb / render_count
-            l_perc = l_perc / render_count
+        if perc_pred_groups:
+            l_perc = _batched_grouped_perceptual_loss(
+                perceptual, perc_pred_groups, perc_gt_groups, device
+            )
 
     # 4. 综合总 Loss
     total_loss = (
