@@ -8,7 +8,7 @@ model:
 
 data:
   data_dir: "/home/chengtianle/GaussianGPT/data/overfit"
-  cache_root: "/root/autodl-tmp/GaussianGPT-Private/data/ae_ase_cache"
+  cache_root: "/home/chengtianle/baiyiyang/GaussianGPT/data/cache/ASE_overfit"
   base_voxel_size: 0.025
   chunk_size: [256, 256, 256]
 
@@ -45,7 +45,7 @@ loss:
 
   n_images: 12
   render_size: 512
-  vgg19_weights_path: "/root/autodl-tmp/GaussianGPT-Private/vgg19-dcbb9e9d.pth"
+  vgg19_weights_path: "/home/chengtianle/baiyiyang/GaussianGPT/checkpoints/vgg19-dcbb9e9d.pth"
 
   fov_deg: 60.0
   radius_factor: 1.5
