@@ -276,6 +276,7 @@ class ASEOnlineChunkSampler:
         preferred_coverage: float = 0.4,
         scene_id: Optional[str] = None,
         scene_ids: Optional[List[str]] = None,
+        fixed_chunk: bool = False,
     ) -> None:
         self.cache_root = Path(cache_root)
         self.scene_cache_paths = sorted((self.cache_root / "scenes").glob("*.npz"))
@@ -307,6 +308,8 @@ class ASEOnlineChunkSampler:
         self.z_mode = z_mode
         self.scene_ids = selected_scene_ids
         self.preferred_coverage = float(preferred_coverage)
+        self.fixed_chunk = bool(fixed_chunk)
+        self._fixed_chunk_state: Optional[Dict] = None
         self.rng = np.random.RandomState(self.seed)
         if self.z_mode not in {"fixed_160", "full_height"}:
             raise ValueError("z_mode must be 'fixed_160' or 'full_height'")
@@ -329,6 +332,7 @@ class ASEOnlineChunkSampler:
         """
         self.seed = int(seed)
         self.rng = np.random.RandomState(self.seed)
+        self._fixed_chunk_state = None
 
     def _load_scene_cache(self, path: Path) -> Dict:
         key = str(path)
@@ -416,14 +420,15 @@ class ASEOnlineChunkSampler:
             )
         return best_chunk_min, best_occupancy, False, candidate_occupancies, best_occupancy
 
-    def sample(self) -> Dict:
-        """Sample one random chunk from a random scene cache."""
+    def _sample_chunk_spec(self) -> Dict:
+        """Choose a scene and chunk, optionally reusing the first sampled one."""
+
+        if self.fixed_chunk and self._fixed_chunk_state is not None:
+            return self._fixed_chunk_state
 
         cache_path = self.scene_cache_paths[int(self.rng.randint(0, len(self.scene_cache_paths)))]
         scene_cache = self._load_scene_cache(cache_path)
         scene_coords = scene_cache["scene_coords"]
-        scene_origin = scene_cache["scene_origin"]
-        metadata = scene_cache["metadata"]
 
         z_info = self._scene_z_info(scene_coords)
         chunk_shape_voxels = z_info["chunk_shape_voxels"]
@@ -434,6 +439,32 @@ class ASEOnlineChunkSampler:
             candidate_occupancies,
             best_candidate_occupancy,
         ) = self._choose_chunk(scene_coords, chunk_shape_voxels)
+        spec = {
+            "cache_path": cache_path,
+            "chunk_min_voxel": chunk_min_voxel.astype(np.int32, copy=True),
+            "chunk_shape_voxels": chunk_shape_voxels.astype(np.int32, copy=True),
+            "occupancy": float(occupancy),
+            "accepted_by_threshold": bool(accepted_by_threshold),
+            "candidate_occupancies": list(candidate_occupancies),
+            "best_candidate_occupancy": float(best_candidate_occupancy),
+            "z_info": z_info,
+        }
+        if self.fixed_chunk:
+            self._fixed_chunk_state = spec
+        return spec
+
+    def sample(self) -> Dict:
+        """Sample one random chunk from a random scene cache."""
+
+        chunk_spec = self._sample_chunk_spec()
+        cache_path = chunk_spec["cache_path"]
+        scene_cache = self._load_scene_cache(cache_path)
+        scene_coords = scene_cache["scene_coords"]
+        scene_origin = scene_cache["scene_origin"]
+        metadata = scene_cache["metadata"]
+        z_info = chunk_spec["z_info"]
+        chunk_min_voxel = chunk_spec["chunk_min_voxel"]
+        chunk_shape_voxels = chunk_spec["chunk_shape_voxels"]
         chunk_max_voxel = chunk_min_voxel + chunk_shape_voxels
         chunk = build_chunk_from_scene_cache(
             scene_cache, chunk_min_voxel, chunk_shape_voxels
@@ -468,7 +499,7 @@ class ASEOnlineChunkSampler:
             "chunk_world_max": chunk_world_max.astype(np.float32, copy=False),
             "voxel_size": voxel_size,
             "chunk_shape_voxels": chunk_shape_voxels.copy(),
-            "occupancy": float(occupancy),
+            "occupancy": float(chunk_spec["occupancy"]),
             "num_occupied_voxels": int(chunk["num_occupied_voxels"]),
             "num_gaussians_after_voxel_dedup": int(scene_coords.shape[0]),
             "top_cameras": top_cameras,
@@ -477,12 +508,14 @@ class ASEOnlineChunkSampler:
                 "pose_convention": cameras.pose_convention,
                 "uses_transform_device_camera": cameras.uses_transform_device_camera,
                 "top_cameras": top_cameras,
+                "fixed_chunk": self.fixed_chunk,
             },
             "z_mode": self.z_mode,
             "scene_z_min_voxel": int(z_info["scene_z_min_voxel"]),
             "scene_z_max_voxel": int(z_info["scene_z_max_voxel"]),
             "scene_z_voxels": int(z_info["scene_z_voxels"]),
-            "accepted_by_threshold": bool(accepted_by_threshold),
-            "candidate_occupancies": candidate_occupancies,
-            "best_candidate_occupancy": float(best_candidate_occupancy),
+            "accepted_by_threshold": bool(chunk_spec["accepted_by_threshold"]),
+            "candidate_occupancies": chunk_spec["candidate_occupancies"],
+            "best_candidate_occupancy": float(chunk_spec["best_candidate_occupancy"]),
+            "fixed_chunk": self.fixed_chunk,
         }

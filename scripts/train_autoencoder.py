@@ -910,6 +910,7 @@ def train(cfg: dict, args):
         z_mode=z_mode,
         preferred_coverage=preferred_coverage,
         scene_ids=train_scene_ids,
+        fixed_chunk=fixed_chunk,
     )
     
     # 替换验证集实例化（可以共享同一个类，指定不同的场景 id 列表）
@@ -924,6 +925,7 @@ def train(cfg: dict, args):
         z_mode=z_mode,
         preferred_coverage=preferred_coverage,
         scene_ids=val_scene_ids,
+        fixed_chunk=fixed_chunk,
     )
 
     batch_size = args.batch_size or cfg["training"]["batch_size"]

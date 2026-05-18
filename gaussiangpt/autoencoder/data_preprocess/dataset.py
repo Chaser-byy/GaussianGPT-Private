@@ -23,6 +23,7 @@ class ASEChunkDataset:
         z_mode: str = "fixed_160",
         preferred_coverage: float = 0.4,
         scene_ids: Optional[List[str]] = None,
+        fixed_chunk: bool = False,
     ) -> None:
         self.num_samples_per_epoch = int(num_samples_per_epoch)
         self._worker_seed: Optional[int] = None
@@ -36,6 +37,7 @@ class ASEChunkDataset:
             z_mode=z_mode,
             preferred_coverage=preferred_coverage,
             scene_ids=scene_ids,
+            fixed_chunk=fixed_chunk,
         )
 
     def __len__(self) -> int:
@@ -77,5 +79,6 @@ class ASEChunkDataset:
             "accepted_by_threshold": sample["accepted_by_threshold"],
             "candidate_occupancies": sample["candidate_occupancies"],
             "best_candidate_occupancy": sample["best_candidate_occupancy"],
+            "fixed_chunk": sample["fixed_chunk"],
         }
         return sample
