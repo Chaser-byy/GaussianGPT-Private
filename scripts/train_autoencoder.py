@@ -530,11 +530,11 @@ def compute_batch_loss(
         total_loss.backward()
 
     return (
-        total_loss, 
-        l_occ.item(), 
-        l_lfq.item(), 
-        float(l_rgb.detach().item()), 
-        float(l_perc.detach().item())
+        total_loss,
+        l_occ.detach(),
+        l_lfq.detach(),
+        l_rgb.detach(),
+        l_perc.detach(),
     )
 
 
@@ -772,8 +772,8 @@ def validate(
         return None
 
     raw_model.eval()
-    total_loss = total_occ = total_lfq = 0.0
-    total_rgb = total_perc = 0.0
+    total_loss = total_occ = total_lfq = None
+    total_rgb = total_perc = None
     recon_tag = f"epoch_{epoch:04d}_step_{global_step:08d}"
     recon_path = os.path.join(output_dir, "val_reconstructions", f"{recon_tag}.ply")
     image_path = os.path.join(output_dir, "val_renderings", f"{recon_tag}.png")
@@ -791,11 +791,17 @@ def validate(
                 raw_model, batch, cfg, device, backward=False,
                 perceptual=perceptual, rng=val_rng,
             )
-            total_loss += batch_loss.item()
-            total_occ += batch_occ
-            total_lfq += batch_lfq
-            total_rgb += batch_rgb
-            total_perc += batch_perc
+            metrics = (
+                batch_loss.detach(), batch_occ, batch_lfq, batch_rgb, batch_perc
+            )
+            if total_loss is None:
+                total_loss, total_occ, total_lfq, total_rgb, total_perc = metrics
+            else:
+                total_loss = total_loss + metrics[0]
+                total_occ = total_occ + metrics[1]
+                total_lfq = total_lfq + metrics[2]
+                total_rgb = total_rgb + metrics[3]
+                total_perc = total_perc + metrics[4]
             if not saved_reconstruction and batch["coords"].numel() > 0:
                 save_validation_reconstruction(
                     raw_model, ase_batch_sample_to_legacy_sample(batch, 0), cfg, device,
@@ -804,12 +810,16 @@ def validate(
                 saved_reconstruction = True
 
     n_batches = len(val_loader)
-    avg_loss = total_loss / n_batches
+    avg_loss = (total_loss / n_batches).item()
+    avg_rgb = (total_rgb / n_batches).item()
+    avg_perc = (total_perc / n_batches).item()
+    avg_occ = (total_occ / n_batches).item()
+    avg_lfq = (total_lfq / n_batches).item()
     print(
         f"Validation Epoch {epoch} Step {global_step} "
         f"Loss: {avg_loss:.4f} "
-        f"rgb: {total_rgb / n_batches:.4f} perc: {total_perc / n_batches:.4f} "
-        f"occ: {total_occ / n_batches:.4f} lfq: {total_lfq / n_batches:.4f}"
+        f"rgb: {avg_rgb:.4f} perc: {avg_perc:.4f} "
+        f"occ: {avg_occ:.4f} lfq: {avg_lfq:.4f}"
     )
     if saved_reconstruction:
         print(f"Saved validation reconstruction: {recon_path}")
@@ -1049,7 +1059,7 @@ def train(cfg: dict, args):
 
     for epoch in range(start_epoch, epochs):
         model.train()
-        total_loss = 0.0
+        total_loss = None
         for step, batch_list in enumerate(train_loader):
             # batch_list is a list of per-sample dicts (sparse_collate)
             # Accumulate gradients over the batch manually
@@ -1069,14 +1079,15 @@ def train(cfg: dict, args):
             optimizer.step()
             global_step += 1
 
-            total_loss += batch_loss.item()
+            detached_loss = batch_loss.detach()
+            total_loss = detached_loss if total_loss is None else total_loss + detached_loss
             if step % 100 == 0:
             # if True:
                 print(
                     f"Epoch {epoch} Step {step}/{len(train_loader)} "
-                    f"Loss: {batch_loss.item():.4f} "
-                    f"rgb: {batch_rgb:.4f} perc: {batch_perc:.4f} "
-                    f"occ: {batch_occ:.4f} lfq: {batch_lfq:.4f}"
+                    f"Loss: {detached_loss.item():.4f} "
+                    f"rgb: {batch_rgb.item():.4f} perc: {batch_perc.item():.4f} "
+                    f"occ: {batch_occ.item():.4f} lfq: {batch_lfq.item():.4f}"
                 )
             if log_grad_norm_every > 0 and global_step % log_grad_norm_every == 0:
                 clipped = float(pre_clip_norm) > grad_clip
@@ -1102,7 +1113,7 @@ def train(cfg: dict, args):
                 model.train()
 
         scheduler.step()
-        avg_loss = total_loss / len(train_loader)
+        avg_loss = (total_loss / len(train_loader)).item()
         print(f"Epoch {epoch} avg loss: {avg_loss:.4f} lr: {scheduler.get_last_lr()[0]:.6f}")
 
         # Save checkpoint
