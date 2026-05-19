@@ -254,6 +254,7 @@ class ASEOnlineChunkSampler:
         preferred_coverage: float = 0.4,
         scene_id: Optional[str] = None,
         scene_ids: Optional[List[str]] = None,
+        compute_top_cameras: bool = False,
     ) -> None:
         self.cache_root = Path(cache_root)
         self.scene_cache_paths = sorted((self.cache_root / "scenes").glob("*.npz"))
@@ -285,6 +286,7 @@ class ASEOnlineChunkSampler:
         self.z_mode = z_mode
         self.scene_ids = selected_scene_ids
         self.preferred_coverage = float(preferred_coverage)
+        self.compute_top_cameras = bool(compute_top_cameras)
         self.rng = np.random.RandomState(self.seed)
         if self.z_mode not in {"fixed_160", "full_height"}:
             raise ValueError("z_mode must be 'fixed_160' or 'full_height'")
@@ -422,14 +424,29 @@ class ASEOnlineChunkSampler:
         chunk_world_max = scene_origin + chunk_max_voxel.astype(np.float32) * voxel_size
 
         transforms_path = metadata["transforms_path"]
-        cameras = self._load_cameras(metadata)
-        top_cameras = select_cameras_for_chunk(
-            cameras,
-            chunk_world_min,
-            chunk_world_max,
-            top_k=self.top_k_cameras,
-            preferred_coverage=self.preferred_coverage,
-        )
+        top_cameras = []
+        camera_debug = {
+            "camera_cache_path": str(self._camera_cache_path(metadata)),
+            "pose_convention": None,
+            "uses_transform_device_camera": None,
+            "top_cameras": top_cameras,
+        }
+        if self.compute_top_cameras:
+            cameras = self._load_cameras(metadata)
+            top_cameras = select_cameras_for_chunk(
+                cameras,
+                chunk_world_min,
+                chunk_world_max,
+                top_k=self.top_k_cameras,
+                preferred_coverage=self.preferred_coverage,
+            )
+            camera_debug.update(
+                {
+                    "pose_convention": cameras.pose_convention,
+                    "uses_transform_device_camera": cameras.uses_transform_device_camera,
+                    "top_cameras": top_cameras,
+                }
+            )
 
         return {
             "scene_id": metadata["scene_id"],
@@ -450,12 +467,7 @@ class ASEOnlineChunkSampler:
             "num_occupied_voxels": int(chunk["num_occupied_voxels"]),
             "num_gaussians_after_voxel_dedup": int(scene_coords.shape[0]),
             "top_cameras": top_cameras,
-            "camera_debug": {
-                "camera_cache_path": str(self._camera_cache_path(metadata)),
-                "pose_convention": cameras.pose_convention,
-                "uses_transform_device_camera": cameras.uses_transform_device_camera,
-                "top_cameras": top_cameras,
-            },
+            "camera_debug": camera_debug,
             "z_mode": self.z_mode,
             "scene_z_min_voxel": int(z_info["scene_z_min_voxel"]),
             "scene_z_max_voxel": int(z_info["scene_z_max_voxel"]),

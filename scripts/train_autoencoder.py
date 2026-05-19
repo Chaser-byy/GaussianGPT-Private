@@ -93,21 +93,22 @@ def _render_loss_for_sample(
     perceptual: nn.Module = None,
     rng: torch.Generator = None,
 ) -> tuple:
-    """Render N views of GT and predicted Gaussians; return (l_rgb, l_perc).
+    """Render N views of GT and predicted Gaussians.
 
     The GT renderings are detached so the renderer is only used as a fixed
-    photo-realistic supervision signal. Returns scalar tensors on `device`.
+    photo-realistic supervision signal. Returns RGB loss plus optional image
+    batches for a later batch-wide perceptual pass.
     """
     if not HAS_RASTERIZER or device.type != "cuda":
         zero = torch.zeros((), device=device)
-        return zero, zero
+        return zero, None, None
 
     loss_cfg = cfg.get("loss", {})
     n_views = int(loss_cfg.get("n_images", 0))
     img_size = int(loss_cfg.get("render_size", 128))
     if n_views <= 0:
         zero = torch.zeros((), device=device)
-        return zero, zero
+        return zero, None, None
 
     base_voxel_size = float(cfg["data"]["base_voxel_size"])
 
@@ -160,25 +161,64 @@ def _render_loss_for_sample(
     }
 
     l_rgb = torch.zeros((), device=device)
-    l_perc = torch.zeros((), device=device)
     perc_buf_pred, perc_buf_gt = [], []
+    need_perc = perceptual is not None and float(loss_cfg.get("lambda_perc", 0.0)) > 0
     for cam in cameras:
         with torch.no_grad():
             img_gt = render_gaussians(gt_pack, cam, bg_color=bg)
         img_pred = render_gaussians(pred_pack, cam, bg_color=bg)
         l_rgb = l_rgb + torch.nn.functional.l1_loss(img_pred, img_gt)
-        if perceptual is not None and float(loss_cfg.get("lambda_perc", 0.0)) > 0:
+        if need_perc:
             perc_buf_pred.append(img_pred)
             perc_buf_gt.append(img_gt)
 
     l_rgb = l_rgb / float(n_views)
-    if perc_buf_pred:
-        # Stack views into a batch for one VGG call (fewer kernel launches).
-        l_perc = perceptual(
-            torch.stack(perc_buf_pred, dim=0),
-            torch.stack(perc_buf_gt, dim=0),
-        )
-    return l_rgb, l_perc
+    if not perc_buf_pred:
+        return l_rgb, None, None
+    return l_rgb, torch.stack(perc_buf_pred, dim=0), torch.stack(perc_buf_gt, dim=0)
+
+
+def _batched_grouped_perceptual_loss(
+    perceptual: nn.Module,
+    pred_groups: list,
+    gt_groups: list,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute the original per-sample VGG loss with one batched extraction."""
+
+    if not pred_groups:
+        return torch.zeros((), device=device)
+
+    if not all(hasattr(perceptual, name) for name in ("_normalise", "_extract")):
+        loss = torch.zeros((), device=device)
+        for pred, gt in zip(pred_groups, gt_groups):
+            loss = loss + perceptual(pred, gt)
+        return loss / float(len(pred_groups))
+
+    group_sizes = [int(group.shape[0]) for group in pred_groups]
+    pred = torch.cat(pred_groups, dim=0)
+    gt = torch.cat(gt_groups, dim=0)
+    pred = perceptual._normalise(pred)
+    gt = perceptual._normalise(gt)
+    feats_pred = perceptual._extract(pred)
+    with torch.no_grad():
+        feats_gt = perceptual._extract(gt)
+
+    total = pred.new_zeros(())
+    start = 0
+    for group_size in group_sizes:
+        sample_loss = pred.new_zeros(())
+        end = start + group_size
+        for fp, ft in zip(feats_pred, feats_gt):
+            fp_group = fp[start:end]
+            ft_group = ft[start:end]
+            n = float(fp_group.numel())
+            inv_sqrt_n = 1.0 / (n ** 0.5)
+            sample_loss = sample_loss + ((fp_group - ft_group) * inv_sqrt_n).pow(2).sum()
+        total = total + sample_loss / float(group_size)
+        start = end
+
+    return total / float(len(group_sizes))
 
 
 # def compute_batch_loss(
@@ -348,6 +388,8 @@ def compute_batch_loss(
     # ---- L_RGB / L_perc 渲染损失（前向并行，渲染串行） ----
     l_rgb = torch.tensor(0.0, device=device)
     l_perc = torch.tensor(0.0, device=device)
+    perc_pred_groups = []
+    perc_gt_groups = []
     
     if lambda_rgb > 0 or lambda_perc > 0:
         # 由于每个场景块有自己独立的相机视角，渲染必须通过 batch_index 拆开分别渲染
@@ -375,15 +417,20 @@ def compute_batch_loss(
             
             # 复用原版的单视图渲染损失函数
             # 注意：传入单样本的相机或场景参数，可以从 batch["metas"][meta_idx] 中灵活读取
-            single_rgb, single_perc = _render_loss_for_sample(
+            single_rgb, single_perc_pred, single_perc_gt = _render_loss_for_sample(
                 meta_sample, sample_pred, sample_gt, cfg, device,
                 perceptual=perceptual, rng=rng
             )
             l_rgb = l_rgb + single_rgb
-            l_perc = l_perc + single_perc
+            if single_perc_pred is not None and single_perc_gt is not None:
+                perc_pred_groups.append(single_perc_pred)
+                perc_gt_groups.append(single_perc_gt)
         if render_count > 0:
             l_rgb = l_rgb / render_count
-            l_perc = l_perc / render_count
+        if perc_pred_groups:
+            l_perc = _batched_grouped_perceptual_loss(
+                perceptual, perc_pred_groups, perc_gt_groups, device
+            )
 
     # 4. 综合总 Loss
     total_loss = (
@@ -397,11 +444,11 @@ def compute_batch_loss(
         total_loss.backward()
 
     return (
-        total_loss, 
-        l_occ.item(), 
-        l_lfq.item(), 
-        float(l_rgb.detach().item()), 
-        float(l_perc.detach().item())
+        total_loss,
+        l_occ.detach(),
+        l_lfq.detach(),
+        l_rgb.detach(),
+        l_perc.detach(),
     )
 
 
@@ -639,8 +686,8 @@ def validate(
         return None
 
     raw_model.eval()
-    total_loss = total_occ = total_lfq = 0.0
-    total_rgb = total_perc = 0.0
+    total_loss = total_occ = total_lfq = None
+    total_rgb = total_perc = None
     recon_tag = f"epoch_{epoch:04d}_step_{global_step:08d}"
     recon_path = os.path.join(output_dir, "val_reconstructions", f"{recon_tag}.ply")
     image_path = os.path.join(output_dir, "val_renderings", f"{recon_tag}.png")
@@ -658,11 +705,17 @@ def validate(
                 raw_model, batch, cfg, device, backward=False,
                 perceptual=perceptual, rng=val_rng,
             )
-            total_loss += batch_loss.item()
-            total_occ += batch_occ
-            total_lfq += batch_lfq
-            total_rgb += batch_rgb
-            total_perc += batch_perc
+            metrics = (
+                batch_loss.detach(), batch_occ, batch_lfq, batch_rgb, batch_perc
+            )
+            if total_loss is None:
+                total_loss, total_occ, total_lfq, total_rgb, total_perc = metrics
+            else:
+                total_loss = total_loss + metrics[0]
+                total_occ = total_occ + metrics[1]
+                total_lfq = total_lfq + metrics[2]
+                total_rgb = total_rgb + metrics[3]
+                total_perc = total_perc + metrics[4]
             if not saved_reconstruction and batch["coords"].numel() > 0:
                 save_validation_reconstruction(
                     raw_model, ase_batch_sample_to_legacy_sample(batch, 0), cfg, device,
@@ -671,12 +724,16 @@ def validate(
                 saved_reconstruction = True
 
     n_batches = len(val_loader)
-    avg_loss = total_loss / n_batches
+    avg_loss = (total_loss / n_batches).item()
+    avg_rgb = (total_rgb / n_batches).item()
+    avg_perc = (total_perc / n_batches).item()
+    avg_occ = (total_occ / n_batches).item()
+    avg_lfq = (total_lfq / n_batches).item()
     print(
         f"Validation Epoch {epoch} Step {global_step} "
         f"Loss: {avg_loss:.4f} "
-        f"rgb: {total_rgb / n_batches:.4f} perc: {total_perc / n_batches:.4f} "
-        f"occ: {total_occ / n_batches:.4f} lfq: {total_lfq / n_batches:.4f}"
+        f"rgb: {avg_rgb:.4f} perc: {avg_perc:.4f} "
+        f"occ: {avg_occ:.4f} lfq: {avg_lfq:.4f}"
     )
     if saved_reconstruction:
         print(f"Saved validation reconstruction: {recon_path}")
@@ -753,6 +810,7 @@ def train(cfg: dict, args):
     top_k_cameras = int(data_cfg.get("top_k_cameras", 12))
     z_mode = str(data_cfg.get("z_mode", "fixed_160"))
     preferred_coverage = float(data_cfg.get("preferred_coverage", 0.4))
+    compute_top_cameras = bool(data_cfg.get("compute_top_cameras", False))
     train_scene_ids = data_cfg.get("train_scene_ids")
     val_scene_ids = data_cfg.get("val_scene_ids")
 
@@ -767,6 +825,7 @@ def train(cfg: dict, args):
         z_mode=z_mode,
         preferred_coverage=preferred_coverage,
         scene_ids=train_scene_ids,
+        compute_top_cameras=compute_top_cameras,
     )
     
     # 替换验证集实例化（可以共享同一个类，指定不同的场景 id 列表）
@@ -781,6 +840,7 @@ def train(cfg: dict, args):
         z_mode=z_mode,
         preferred_coverage=preferred_coverage,
         scene_ids=val_scene_ids,
+        compute_top_cameras=compute_top_cameras,
     )
 
     batch_size = args.batch_size or cfg["training"]["batch_size"]
@@ -916,7 +976,7 @@ def train(cfg: dict, args):
 
     for epoch in range(start_epoch, epochs):
         model.train()
-        total_loss = 0.0
+        total_loss = None
         for step, batch_list in enumerate(train_loader):
             # batch_list is a list of per-sample dicts (sparse_collate)
             # Accumulate gradients over the batch manually
@@ -936,14 +996,15 @@ def train(cfg: dict, args):
             optimizer.step()
             global_step += 1
 
-            total_loss += batch_loss.item()
+            detached_loss = batch_loss.detach()
+            total_loss = detached_loss if total_loss is None else total_loss + detached_loss
             if step % 100 == 0:
             # if True:
                 print(
                     f"Epoch {epoch} Step {step}/{len(train_loader)} "
-                    f"Loss: {batch_loss.item():.4f} "
-                    f"rgb: {batch_rgb:.4f} perc: {batch_perc:.4f} "
-                    f"occ: {batch_occ:.4f} lfq: {batch_lfq:.4f}"
+                    f"Loss: {detached_loss.item():.4f} "
+                    f"rgb: {batch_rgb.item():.4f} perc: {batch_perc.item():.4f} "
+                    f"occ: {batch_occ.item():.4f} lfq: {batch_lfq.item():.4f}"
                 )
             if log_grad_norm_every > 0 and global_step % log_grad_norm_every == 0:
                 clipped = float(pre_clip_norm) > grad_clip
@@ -969,7 +1030,7 @@ def train(cfg: dict, args):
                 model.train()
 
         scheduler.step()
-        avg_loss = total_loss / len(train_loader)
+        avg_loss = (total_loss / len(train_loader)).item()
         print(f"Epoch {epoch} avg loss: {avg_loss:.4f} lr: {scheduler.get_last_lr()[0]:.6f}")
 
         # Save checkpoint

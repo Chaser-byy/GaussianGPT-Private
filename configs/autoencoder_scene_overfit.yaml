@@ -19,6 +19,7 @@ data:
   min_occupancy_ae: 0.2
   max_candidate_chunks: 50
   top_k_cameras: 12
+  compute_top_cameras: false
   z_mode: "fixed_160"
   preferred_coverage: 0.4
 
