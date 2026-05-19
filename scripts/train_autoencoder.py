@@ -254,52 +254,6 @@ def _batched_grouped_perceptual_loss(
     return total / float(len(group_sizes))
 
 
-def _sparse_occupancy_targets(
-    occ_coords: torch.Tensor,
-    gt_coords: torch.Tensor,
-    stage_idx: int,
-    num_stages: int,
-    stage_stride=None,
-) -> torch.Tensor:
-    """Build 0/1 occupancy targets for one decoder upsampling stage.
-
-    A predicted active coordinate is positive only when it corresponds to at
-    least one ground-truth occupied voxel at that stage resolution.
-    """
-
-    if occ_coords.numel() == 0:
-        return torch.zeros((0,), dtype=torch.float32, device=gt_coords.device)
-
-    gt_coords = gt_coords.to(device=occ_coords.device, dtype=occ_coords.dtype)
-    if gt_coords.numel() == 0:
-        return torch.zeros((occ_coords.shape[0],), dtype=torch.float32, device=occ_coords.device)
-
-    if stage_stride is None:
-        scale = 2 ** max(num_stages - stage_idx - 1, 0)
-    elif hasattr(stage_stride, "__len__"):
-        scale = int(stage_stride[0])
-    else:
-        scale = int(stage_stride)
-    if scale > 1:
-        gt_stage = gt_coords.clone()
-        gt_stage[:, 1:] = torch.div(gt_stage[:, 1:], scale, rounding_mode="floor")
-    else:
-        gt_stage = gt_coords
-
-    gt_stage = torch.unique(gt_stage, dim=0)
-    dims = torch.maximum(occ_coords.max(dim=0).values, gt_stage.max(dim=0).values) + 1
-    dims = dims.clamp_min(1).long()
-    multipliers = torch.empty((4,), dtype=torch.long, device=occ_coords.device)
-    multipliers[3] = 1
-    multipliers[2] = dims[3]
-    multipliers[1] = dims[2] * multipliers[2]
-    multipliers[0] = dims[1] * multipliers[1]
-
-    occ_keys = (occ_coords.long() * multipliers).sum(dim=1)
-    gt_keys = (gt_stage.long() * multipliers).sum(dim=1)
-    return torch.isin(occ_keys, gt_keys).to(dtype=torch.float32)
-
-
 # def compute_batch_loss(
 #     raw_model,
 #     batch_list,
@@ -454,13 +408,8 @@ def compute_batch_loss(
     if occ_list:
         for stage_idx, occ in enumerate(occ_list):
             occ_feat = occ.F  # (M, 1)
-            targets = _sparse_occupancy_targets(
-                occ.C,
-                coords,
-                stage_idx=stage_idx,
-                num_stages=len(occ_list),
-                stage_stride=getattr(occ, "tensor_stride", None),
-            )
+            # 此时真值可以直接对应当前激活特征覆盖范围（全 1 监督掩码）
+            targets = torch.ones(occ_feat.shape[0], device=device)
             l_occ = l_occ + torch.nn.functional.binary_cross_entropy_with_logits(
                 occ_feat.squeeze(-1), targets
             )
