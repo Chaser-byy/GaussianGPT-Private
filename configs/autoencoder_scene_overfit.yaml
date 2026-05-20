@@ -17,7 +17,7 @@ data:
   val_samples_per_epoch: 1
 
   min_occupancy_ae: 0.2
-  max_candidate_chunks: 50
+  max_candidate_chunks: 10
   top_k_cameras: 12
   compute_top_cameras: false
   z_mode: "fixed_160"
