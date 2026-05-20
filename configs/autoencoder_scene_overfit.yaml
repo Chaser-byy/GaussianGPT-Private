@@ -3,7 +3,7 @@
 model:
   base_ch: 128
   n_down: 3
-  codebook_size: 16384
+  codebook_size: 4096
   use_sh: false
 
 data:
@@ -18,7 +18,7 @@ data:
   val_samples_per_epoch: 1
 
   min_occupancy_ae: 0.2
-  max_candidate_chunks: 50
+  max_candidate_chunks: 10
   top_k_cameras: 12
   z_mode: "fixed_160"
   preferred_coverage: 0.4
@@ -39,14 +39,14 @@ data:
   val_seed: 42
 
 loss:
-  lambda_rgb: 5
-  lambda_perc: 1.0
+  lambda_rgb: 7.5
+  lambda_perc: 0.3
   lambda_occ: 1.0
   lambda_lfq: 0.1
 
   n_images: 12
   render_size: 512
-  perceptual_batch_size: 1
+  perceptual_batch_size: 12
   cache_fixed_gt_render: true
   vgg19_weights_path: "/home/chengtianle/baiyiyang/GaussianGPT/checkpoints/vgg19-dcbb9e9d.pth"
 
