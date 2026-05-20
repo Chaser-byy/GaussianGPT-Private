@@ -162,6 +162,7 @@ def _render_loss_for_sample(
     l_rgb = torch.zeros((), device=device)
     l_perc = torch.zeros((), device=device)
     perc_buf_pred, perc_buf_gt = [], []
+    perc_batch_size = max(1, int(loss_cfg.get("perceptual_batch_size", 1)))
     for cam in cameras:
         with torch.no_grad():
             img_gt = render_gaussians(gt_pack, cam, bg_color=bg)
@@ -173,11 +174,16 @@ def _render_loss_for_sample(
 
     l_rgb = l_rgb / float(n_views)
     if perc_buf_pred:
-        # Stack views into a batch for one VGG call (fewer kernel launches).
-        l_perc = perceptual(
-            torch.stack(perc_buf_pred, dim=0),
-            torch.stack(perc_buf_gt, dim=0),
-        )
+        # VGG at 512px is memory-heavy. Run it in small chunks so the peak
+        # activation footprint is bounded by perceptual_batch_size rather than
+        # n_views, while preserving the same average-over-views loss.
+        for start in range(0, len(perc_buf_pred), perc_batch_size):
+            end = start + perc_batch_size
+            pred_chunk = torch.stack(perc_buf_pred[start:end], dim=0)
+            gt_chunk = torch.stack(perc_buf_gt[start:end], dim=0)
+            chunk_loss = perceptual(pred_chunk, gt_chunk)
+            l_perc = l_perc + chunk_loss * float(pred_chunk.shape[0])
+        l_perc = l_perc / float(len(perc_buf_pred))
     return l_rgb, l_perc
 
 

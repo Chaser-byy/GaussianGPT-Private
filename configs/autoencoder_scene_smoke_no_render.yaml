@@ -39,6 +39,7 @@ loss:
   lambda_lfq: 0.1
   n_images: 1             # M = 12 random viewpoints per scene per step (L3DG room)
   render_size: 512          # square image side; lower for speed if VRAM bound
+  perceptual_batch_size: 1   # Bound VGG activation memory; increase only if VRAM allows.
   vgg19_weights_path: "/home/chengtianle/GaussianGPT/checkpoints/vgg19-dcbb9e9d.pth"
   fov_deg: 60.0             # camera horizontal/vertical FOV
   radius_factor: 1.5        # camera distance = 1.5 · half-bbox-diagonal

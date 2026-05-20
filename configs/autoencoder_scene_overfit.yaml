@@ -46,6 +46,7 @@ loss:
 
   n_images: 12
   render_size: 512
+  perceptual_batch_size: 1
   vgg19_weights_path: "/home/chengtianle/baiyiyang/GaussianGPT/checkpoints/vgg19-dcbb9e9d.pth"
 
   fov_deg: 60.0
