@@ -122,13 +122,34 @@ if HAS_MINKOWSKI:
                 [SparseUpBlock(chs[i], chs[i + 1], norm=norm) for i in range(n_up)]
             )
             self.out_proj = ME.MinkowskiConvolution(chs[-1], out_ch or base_ch, kernel_size=1, stride=1, dimension=3)
+            self.pruning = ME.MinkowskiPruning()
 
-        def forward(self, x):
+        @staticmethod
+        def _occupancy_keep_mask(occ, threshold: float, min_keep: int) -> torch.Tensor:
+            logits = occ.F.squeeze(-1)
+            keep = torch.sigmoid(logits) >= float(threshold)
+            if min_keep > 0 and logits.numel() > 0 and int(keep.sum().item()) < min_keep:
+                topk = min(int(min_keep), logits.numel())
+                _, idx = torch.topk(logits, k=topk)
+                keep = torch.zeros_like(keep)
+                keep[idx] = True
+            return keep
+
+        def forward(
+            self,
+            x,
+            prune: bool = False,
+            occupancy_threshold: float = 0.5,
+            min_keep: int = 1,
+        ):
             x = self.proj(x)
             occ_list = []
             for u in self.ups:
                 x, occ = u(x)
                 occ_list.append(occ)
+                if prune:
+                    keep = self._occupancy_keep_mask(occ, occupancy_threshold, min_keep)
+                    x = self.pruning(x, keep)
             return self.out_proj(x), occ_list
 
 else:
@@ -197,7 +218,25 @@ else:
             self._n_up = n_up
             self._chs = chs
 
-        def forward(self, x: torch.Tensor):
+        @staticmethod
+        def _dense_keep_mask(occ: torch.Tensor, threshold: float, min_keep: int) -> torch.Tensor:
+            keep = torch.sigmoid(occ) >= float(threshold)
+            if min_keep > 0 and occ.numel() > 0 and int(keep.sum().item()) < min_keep:
+                flat_logits = occ.reshape(-1)
+                topk = min(int(min_keep), flat_logits.numel())
+                _, idx = torch.topk(flat_logits, k=topk)
+                flat_keep = torch.zeros_like(flat_logits, dtype=torch.bool)
+                flat_keep[idx] = True
+                keep = flat_keep.reshape_as(occ)
+            return keep
+
+        def forward(
+            self,
+            x: torch.Tensor,
+            prune: bool = False,
+            occupancy_threshold: float = 0.5,
+            min_keep: int = 1,
+        ):
             x = self.proj(x)
             occ_list = []
             idx = 0
@@ -206,5 +245,9 @@ else:
                 x = self.ups[idx](x); idx += 1
                 x = self.ups[idx](x); idx += 1
                 x = self.ups[idx](x); idx += 1
-                occ_list.append(self.occ_heads[i](x))
+                occ = self.occ_heads[i](x)
+                occ_list.append(occ)
+                if prune:
+                    keep = self._dense_keep_mask(occ, occupancy_threshold, min_keep)
+                    x = x * keep.to(dtype=x.dtype)
             return self.out_proj(x), occ_list

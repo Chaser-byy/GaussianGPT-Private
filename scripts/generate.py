@@ -46,6 +46,12 @@ def parse_args():
     parser.add_argument("--ae_n_down", type=int, default=3)
     parser.add_argument("--gpt_size", type=str, default="medium")
     parser.add_argument("--gpt_context", type=int, default=16384)
+    parser.add_argument("--occ_threshold", type=float, default=0.5,
+                        help="Occupancy probability threshold for decoder pruning")
+    parser.add_argument("--prune_min_keep", type=int, default=1,
+                        help="Minimum voxels to keep per decoder pruning stage")
+    parser.add_argument("--disable_occupancy_pruning", action="store_true",
+                        help="Disable decoder occupancy pruning during generation")
     return parser.parse_args()
 
 
@@ -78,7 +84,17 @@ def load_models(args):
     return ae, gpt, device
 
 
-def decode_tokens_to_gaussians(ae, gpt, tokens, coords, token_type, device):
+def decode_tokens_to_gaussians(
+    ae,
+    gpt,
+    tokens,
+    coords,
+    token_type,
+    device,
+    prune: bool = True,
+    occupancy_threshold: float = 0.5,
+    prune_min_keep: int = 1,
+):
     """Decode generated token sequence back to 3D Gaussians."""
     from gaussiangpt.utils.serialization import deserialize_token_sequence
 
@@ -106,7 +122,12 @@ def decode_tokens_to_gaussians(ae, gpt, tokens, coords, token_type, device):
         coords_me = torch.cat([batch_idx, voxel_coords.to(device)], dim=1)
         latent_stride = 2**ae.n_down   # 8 = 2 ** 3暂时写死, 后面可以改
         sparse_input = ME.SparseTensor(features=z_q, coordinates=coords_me, tensor_stride=latent_stride)
-        decoded, _ = ae.decoder(sparse_input)
+        decoded, _ = ae.decoder(
+            sparse_input,
+            prune=prune,
+            occupancy_threshold=occupancy_threshold,
+            min_keep=prune_min_keep,
+        )
         feat = decoded.F
         voxel_coords = decoded.C[:, 1:]
     else:
@@ -138,7 +159,17 @@ def generate_unconditional(ae, gpt, args, device):
                 device=device,
             )
 
-        gaussians = decode_tokens_to_gaussians(ae, gpt, tokens, coords, token_type, device)
+        gaussians = decode_tokens_to_gaussians(
+            ae,
+            gpt,
+            tokens,
+            coords,
+            token_type,
+            device,
+            prune=not args.disable_occupancy_pruning,
+            occupancy_threshold=args.occ_threshold,
+            prune_min_keep=args.prune_min_keep,
+        )
         if gaussians is not None:
             results.append({k: v.cpu() for k, v in gaussians.items()})
 
@@ -185,7 +216,17 @@ def generate_completion(ae, gpt, args, device):
             device=device,
         )
 
-    gaussians = decode_tokens_to_gaussians(ae, gpt, tokens, coords, token_type, device)
+    gaussians = decode_tokens_to_gaussians(
+        ae,
+        gpt,
+        tokens,
+        coords,
+        token_type,
+        device,
+        prune=not args.disable_occupancy_pruning,
+        occupancy_threshold=args.occ_threshold,
+        prune_min_keep=args.prune_min_keep,
+    )
     return [gaussians] if gaussians is not None else []
 
 
@@ -208,7 +249,17 @@ def generate_outpainting(ae, gpt, args, device):
             device=device,
         )
 
-    seed_gaussians = decode_tokens_to_gaussians(ae, gpt, tokens, coords, token_type, device)
+    seed_gaussians = decode_tokens_to_gaussians(
+        ae,
+        gpt,
+        tokens,
+        coords,
+        token_type,
+        device,
+        prune=not args.disable_occupancy_pruning,
+        occupancy_threshold=args.occ_threshold,
+        prune_min_keep=args.prune_min_keep,
+    )
     if seed_gaussians is not None:
         all_gaussians.append((seed_gaussians, torch.zeros(3, dtype=torch.long)))
 
@@ -231,7 +282,15 @@ def generate_outpainting(ae, gpt, args, device):
                         device=device,
                     )
                 gaussians = decode_tokens_to_gaussians(
-                    ae, gpt, tokens, coords, token_type, device
+                    ae,
+                    gpt,
+                    tokens,
+                    coords,
+                    token_type,
+                    device,
+                    prune=not args.disable_occupancy_pruning,
+                    occupancy_threshold=args.occ_threshold,
+                    prune_min_keep=args.prune_min_keep,
                 )
                 if gaussians is not None and len(gaussians.get("voxel_coords", [])) > 0:
                     break
