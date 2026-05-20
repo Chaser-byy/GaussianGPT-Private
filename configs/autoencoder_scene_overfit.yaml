@@ -82,4 +82,5 @@ debug:
   voxel_dedup: "nearest"
 
   grad_clip: 1000.0
+  occ_check_every: 100
   log_grad_norm_every: 20

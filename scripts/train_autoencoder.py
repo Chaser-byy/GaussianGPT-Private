@@ -229,6 +229,62 @@ def _render_loss_for_sample(
     return l_rgb, l_perc
 
 
+def _coord_hash(coords: torch.Tensor) -> torch.Tensor:
+    """Build collision-free integer hashes for a small set of 4D sparse coords."""
+
+    coords = coords.to(torch.long)
+    mins = coords.min(dim=0).values
+    shifted = coords - mins
+    dims = shifted.max(dim=0).values + 1
+    key = shifted[:, 0]
+    for dim in range(1, shifted.shape[1]):
+        key = key * dims[dim] + shifted[:, dim]
+    return key
+
+
+def _sparse_occupancy_targets(
+    occ,
+    gt_coords: torch.Tensor,
+    stage_idx: int,
+    n_stages: int,
+    device: torch.device,
+) -> tuple:
+    """Align a decoder occupancy SparseTensor with the current chunk occupancy.
+
+    ``gt_coords`` are batched base-voxel coordinates ``[b, x, y, z]`` from the
+    dataloader. Each decoder occupancy head lives at its own tensor stride, so
+    GT occupied voxels are downsampled to that stage before matching against
+    ``occ.C``. The returned target has exactly one value per occupancy logit.
+    """
+
+    occ_coords = occ.C.to(device=device, dtype=torch.long)
+    occ_logits = occ.F.squeeze(-1)
+    tensor_stride = getattr(occ, "tensor_stride", None)
+    if tensor_stride is None:
+        stride = 2 ** max(n_stages - stage_idx - 1, 0)
+    elif isinstance(tensor_stride, (list, tuple)):
+        stride = int(tensor_stride[0])
+    else:
+        stride = int(tensor_stride)
+    stride = max(stride, 1)
+
+    if occ_logits.numel() == 0:
+        return occ_logits, torch.empty_like(occ_logits), stride
+
+    gt_stage_coords = gt_coords.to(device=device, dtype=torch.long).clone()
+    gt_stage_coords[:, 1:] = torch.div(
+        gt_stage_coords[:, 1:], stride, rounding_mode="floor"
+    )
+    gt_stage_coords = torch.unique(gt_stage_coords, dim=0)
+
+    all_coords = torch.cat([occ_coords, gt_stage_coords], dim=0)
+    all_hash = _coord_hash(all_coords)
+    occ_hash = all_hash[: occ_coords.shape[0]]
+    gt_hash = torch.unique(all_hash[occ_coords.shape[0]:])
+    targets = torch.isin(occ_hash, gt_hash).to(dtype=occ_logits.dtype)
+    return occ_logits, targets, stride
+
+
 # def compute_batch_loss(
 #     raw_model,
 #     batch_list,
@@ -345,6 +401,7 @@ def compute_batch_loss(
     perceptual: nn.Module = None,
     rng: torch.Generator = None,
     gt_render_cache: Optional[dict] = None,
+    global_step: Optional[int] = None,
 ):
     from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
 
@@ -381,15 +438,50 @@ def compute_batch_loss(
 
     # ---- L_occ 占位损失计算 ----
     l_occ = torch.tensor(0.0, device=device)
+    occ_debug = []
+    occ_stage_count = 0
     if occ_list:
         for stage_idx, occ in enumerate(occ_list):
-            occ_feat = occ.F  # (M, 1)
-            # 此时真值可以直接对应当前激活特征覆盖范围（全 1 监督掩码）
-            targets = torch.ones(occ_feat.shape[0], device=device)
-            l_occ = l_occ + torch.nn.functional.binary_cross_entropy_with_logits(
-                occ_feat.squeeze(-1), targets
+            occ_logits, targets, stride = _sparse_occupancy_targets(
+                occ, coords, stage_idx, len(occ_list), device
             )
-        l_occ = l_occ / len(occ_list)
+            if occ_logits.numel() == 0:
+                continue
+            stage_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                occ_logits, targets
+            )
+            l_occ = l_occ + stage_loss
+            occ_stage_count += 1
+            positives = int(targets.sum().detach().item())
+            total = int(targets.numel())
+            occ_debug.append(
+                {
+                    "stage": stage_idx,
+                    "stride": stride,
+                    "logits": total,
+                    "positives": positives,
+                    "ratio": float(positives / max(total, 1)),
+                    "loss": float(stage_loss.detach().item()),
+                }
+            )
+        if occ_stage_count > 0:
+            l_occ = l_occ / occ_stage_count
+    occ_log_every = int(cfg.get("debug", {}).get("occ_check_every", 0))
+    if occ_log_every > 0 and global_step is not None and occ_debug:
+        if global_step == 1 or global_step % occ_log_every == 0:
+            pieces = [
+                (
+                    f"s{item['stage']}:stride={item['stride']} "
+                    f"logits={item['logits']} pos={item['positives']} "
+                    f"ratio={item['ratio']:.3f} loss={item['loss']:.4f}"
+                )
+                for item in occ_debug
+            ]
+            print(
+                f"  [occ target] step={global_step} "
+                f"gt_voxels={int(coords.shape[0])} "
+                + " | ".join(pieces)
+            )
 
     # ---- L_LFQ 量化离散损失 ----
     l_lfq = torch.nn.functional.softplus(lfq_loss + 5.0)
@@ -709,6 +801,7 @@ def validate(
                 raw_model, batch, cfg, device, backward=False,
                 perceptual=perceptual, rng=val_rng,
                 gt_render_cache=gt_render_cache,
+                global_step=global_step,
             )
             total_loss += batch_loss.item()
             total_occ += batch_occ
@@ -1004,6 +1097,7 @@ def train(cfg: dict, args):
              batch_rgb, batch_perc) = compute_batch_loss(
                 raw_model, batch_list, cfg, device, backward=True,
                 perceptual=perceptual, gt_render_cache=gt_render_cache,
+                global_step=global_step + 1,
             )
 
             # ``clip_grad_norm_`` returns the *pre-clip* total gradient

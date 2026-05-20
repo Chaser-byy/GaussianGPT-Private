@@ -122,6 +122,7 @@ debug:
   voxel_dedup: "random"     # 关键：消除 GT 颜色的随机性
   grad_clip: 1000.0          # 安全网而非瓶颈：3DGS 训练梯度自然在 100~500，clip 设到很高
                               #   只在出现 1e5+ 的病态尖刺时熔断，让 Adam 的自适应正常工作
+  occ_check_every: 0
   log_grad_norm_every: 8
 
 # debug:
