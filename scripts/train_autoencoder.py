@@ -92,6 +92,7 @@ def _render_loss_for_sample(
     device: torch.device,
     perceptual: nn.Module = None,
     rng: torch.Generator = None,
+    gt_render_cache: Optional[dict] = None,
 ) -> tuple:
     """Render N views of GT and predicted Gaussians; return (l_rgb, l_perc).
 
@@ -126,23 +127,6 @@ def _render_loss_for_sample(
         pred_sample, pred_gaussians["offset"], base_voxel_size, device
     )
 
-    # Camera sphere is sized from the GT bbox so the views naturally cover
-    # the scene as it gets reconstructed.
-    bbox_min = gt_position.min(dim=0).values.detach()
-    bbox_max = gt_position.max(dim=0).values.detach()
-    cameras = sample_cameras_around_bbox(
-        bbox_min=bbox_min,
-        bbox_max=bbox_max,
-        n_views=n_views,
-        image_height=img_size,
-        image_width=img_size,
-        fov_deg=float(loss_cfg.get("fov_deg", 60.0)),
-        radius_factor=float(loss_cfg.get("radius_factor", 1.5)),
-        upper_hemisphere_only=bool(loss_cfg.get("upper_hemisphere_only", False)),
-        jitter=float(loss_cfg.get("camera_jitter", 0.0)),
-        rng=rng,
-    )
-
     bg = torch.zeros(3, device=device)
     gt_pack = {
         "position": gt_position,
@@ -159,18 +143,76 @@ def _render_loss_for_sample(
         "color": pred_gaussians["color"],
     }
 
+    fov_deg = float(loss_cfg.get("fov_deg", 60.0))
+    radius_factor = float(loss_cfg.get("radius_factor", 1.5))
+    upper_hemisphere_only = bool(loss_cfg.get("upper_hemisphere_only", False))
+    camera_jitter = float(loss_cfg.get("camera_jitter", 0.0))
+    cache_key = None
+    cameras = None
+    cached_gt_imgs = None
+    if gt_render_cache is not None and camera_jitter == 0.0:
+        meta = sample.get("metadata", {})
+        chunk_origin_value = meta.get("chunk_min_voxel", sample.get("chunk_origin"))
+        if torch.is_tensor(chunk_origin_value):
+            chunk_origin_value = chunk_origin_value.detach().cpu().tolist()
+        chunk_origin_key = tuple(int(v) for v in chunk_origin_value)
+        cache_key = (
+            str(meta.get("scene_id", "")),
+            chunk_origin_key,
+            int(sample["voxel_coords"].shape[0]),
+            str(device),
+            int(n_views),
+            int(img_size),
+            float(fov_deg),
+            float(radius_factor),
+            bool(upper_hemisphere_only),
+        )
+        cached = gt_render_cache.get(cache_key)
+        if cached is not None:
+            cameras = cached["cameras"]
+            cached_gt_imgs = cached["gt_imgs"]
+
+    if cameras is None:
+        # Camera sphere is sized from the GT bbox so the views naturally cover
+        # the scene as it gets reconstructed.
+        bbox_min = gt_position.min(dim=0).values.detach()
+        bbox_max = gt_position.max(dim=0).values.detach()
+        cameras = sample_cameras_around_bbox(
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+            n_views=n_views,
+            image_height=img_size,
+            image_width=img_size,
+            fov_deg=fov_deg,
+            radius_factor=radius_factor,
+            upper_hemisphere_only=upper_hemisphere_only,
+            jitter=camera_jitter,
+            rng=rng,
+        )
+
     l_rgb = torch.zeros((), device=device)
     l_perc = torch.zeros((), device=device)
     perc_buf_pred, perc_buf_gt = [], []
     perc_batch_size = max(1, int(loss_cfg.get("perceptual_batch_size", 1)))
-    for cam in cameras:
-        with torch.no_grad():
-            img_gt = render_gaussians(gt_pack, cam, bg_color=bg)
+    gt_imgs_to_cache = [] if cache_key is not None and cached_gt_imgs is None else None
+    for view_idx, cam in enumerate(cameras):
+        if cached_gt_imgs is not None:
+            img_gt = cached_gt_imgs[view_idx]
+        else:
+            with torch.no_grad():
+                img_gt = render_gaussians(gt_pack, cam, bg_color=bg).detach()
+            if gt_imgs_to_cache is not None:
+                gt_imgs_to_cache.append(img_gt)
         img_pred = render_gaussians(pred_pack, cam, bg_color=bg)
         l_rgb = l_rgb + torch.nn.functional.l1_loss(img_pred, img_gt)
         if perceptual is not None and float(loss_cfg.get("lambda_perc", 0.0)) > 0:
             perc_buf_pred.append(img_pred)
             perc_buf_gt.append(img_gt)
+    if gt_imgs_to_cache is not None:
+        gt_render_cache[cache_key] = {
+            "cameras": cameras,
+            "gt_imgs": tuple(gt_imgs_to_cache),
+        }
 
     l_rgb = l_rgb / float(n_views)
     if perc_buf_pred:
@@ -302,6 +344,7 @@ def compute_batch_loss(
     backward: bool = False,
     perceptual: nn.Module = None,
     rng: torch.Generator = None,
+    gt_render_cache: Optional[dict] = None,
 ):
     from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
 
@@ -376,14 +419,15 @@ def compute_batch_loss(
             meta_sample = {
                 "voxel_coords": coords[gt_mask, 1:4],  # 去掉开头的 batch 维，还原成 3D 坐标
                 "pred_voxel_coords": pred_coords[pred_mask, 1:4],
-                "chunk_origin": torch.tensor(batch["metas"][meta_idx]["chunk_min_voxel"], device=device)
+                "chunk_origin": torch.tensor(batch["metas"][meta_idx]["chunk_min_voxel"], device=device),
+                "metadata": batch["metas"][meta_idx],
             }
             
             # 复用原版的单视图渲染损失函数
             # 注意：传入单样本的相机或场景参数，可以从 batch["metas"][meta_idx] 中灵活读取
             single_rgb, single_perc = _render_loss_for_sample(
                 meta_sample, sample_pred, sample_gt, cfg, device,
-                perceptual=perceptual, rng=rng
+                perceptual=perceptual, rng=rng, gt_render_cache=gt_render_cache
             )
             l_rgb = l_rgb + single_rgb
             l_perc = l_perc + single_perc
@@ -638,6 +682,7 @@ def validate(
     global_step: int,
     output_dir: str,
     perceptual: nn.Module = None,
+    gt_render_cache: Optional[dict] = None,
 ):
     """Run validation over the full validation loader and print average losses."""
     if len(val_loader) == 0:
@@ -663,6 +708,7 @@ def validate(
              batch_rgb, batch_perc) = compute_batch_loss(
                 raw_model, batch, cfg, device, backward=False,
                 perceptual=perceptual, rng=val_rng,
+                gt_render_cache=gt_render_cache,
             )
             total_loss += batch_loss.item()
             total_occ += batch_occ
@@ -933,6 +979,20 @@ def train(cfg: dict, args):
                     weights_path=loss_cfg.get("vgg19_weights_path"),
                 )
 
+    cache_fixed_gt_render = (
+        fixed_chunk
+        and use_render
+        and HAS_RASTERIZER
+        and device.type == "cuda"
+        and float(loss_cfg.get("camera_jitter", 0.0)) == 0.0
+        and bool(loss_cfg.get("cache_fixed_gt_render", True))
+    )
+    gt_render_cache = {} if cache_fixed_gt_render else None
+    if cache_fixed_gt_render:
+        print("[fixed_chunk] GT render cache enabled (camera_jitter=0.0)")
+    elif fixed_chunk and use_render:
+        print("[fixed_chunk] GT render cache disabled")
+
     for epoch in range(start_epoch, epochs):
         model.train()
         total_loss = 0.0
@@ -943,7 +1003,7 @@ def train(cfg: dict, args):
             (batch_loss, batch_occ, batch_lfq,
              batch_rgb, batch_perc) = compute_batch_loss(
                 raw_model, batch_list, cfg, device, backward=True,
-                perceptual=perceptual,
+                perceptual=perceptual, gt_render_cache=gt_render_cache,
             )
 
             # ``clip_grad_norm_`` returns the *pre-clip* total gradient
@@ -984,6 +1044,7 @@ def train(cfg: dict, args):
                 validate(
                     raw_model, val_loader, cfg, device, epoch,
                     global_step, args.output_dir, perceptual=perceptual,
+                    gt_render_cache=gt_render_cache,
                 )
                 model.train()
 
