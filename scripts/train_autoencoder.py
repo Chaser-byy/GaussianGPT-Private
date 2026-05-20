@@ -693,9 +693,10 @@ def train(cfg: dict, args):
     # ---- Debug toggles (all OFF by default = paper-faithful) ----
     # See README / configs/autoencoder_scene.yaml for the full list.
     debug_cfg = cfg.get("debug", {}) or {}
+    data_debug_cfg = cfg.get("data", {}) or {}
     norm_kind = str(debug_cfg.get("norm", "bn")).lower()
     color_act = str(debug_cfg.get("color_activation", "clamp")).lower()
-    fixed_chunk = bool(debug_cfg.get("fixed_chunk", False))
+    fixed_chunk = bool(data_debug_cfg.get("fixed_chunk", debug_cfg.get("fixed_chunk", False)))
     no_augment = bool(debug_cfg.get("no_augment", False))
     voxel_dedup = str(debug_cfg.get("voxel_dedup", "random")).lower()
     grad_clip = float(debug_cfg.get("grad_clip", 1.0))
@@ -767,7 +768,9 @@ def train(cfg: dict, args):
         z_mode=z_mode,
         preferred_coverage=preferred_coverage,
         scene_ids=train_scene_ids,
+        fixed_chunk=fixed_chunk,
     )
+    fixed_sample = train_dataset.fixed_sample() if fixed_chunk else None
     
     # 替换验证集实例化（可以共享同一个类，指定不同的场景 id 列表）
     val_dataset = ASEChunkDataset(
@@ -781,7 +784,17 @@ def train(cfg: dict, args):
         z_mode=z_mode,
         preferred_coverage=preferred_coverage,
         scene_ids=val_scene_ids,
+        fixed_chunk=fixed_chunk,
+        fixed_sample=fixed_sample,
     )
+    if fixed_chunk:
+        print("[fixed_chunk] enabled")
+        summary = train_dataset.fixed_chunk_summary()
+        if summary is not None:
+            print(f"[fixed_chunk] using {summary}")
+        print("[fixed_chunk] validation dataset reuses the training fixed chunk")
+    else:
+        print("[fixed_chunk] disabled; using online chunk sampling")
 
     batch_size = args.batch_size or cfg["training"]["batch_size"]
     

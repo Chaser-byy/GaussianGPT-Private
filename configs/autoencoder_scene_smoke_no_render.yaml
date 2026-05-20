@@ -15,6 +15,7 @@ data:
   cache_root: null                  # ASE voxel cache root; can also pass --cache_root
   base_voxel_size: 0.025          # 2.5 cm
   chunk_size: [256, 256, 256]     # base voxels; latent chunk = 32^3 (transformer seq ~ 32k)
+  fixed_chunk: false              # When true, cache one sampled ASE chunk and reuse it for train/val.
   min_occupancy_ae: 0.2
   train_samples_per_epoch: 1000
   val_samples_per_epoch: 200

@@ -13,6 +13,7 @@ data:
   chunk_size: [256, 256, 256]
 
   # 单 chunk 过拟合：epoch 内反复看同一个固定 chunk。
+  fixed_chunk: true
   train_samples_per_epoch: 1000
   val_samples_per_epoch: 1
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -23,20 +24,30 @@ class ASEChunkDataset:
         z_mode: str = "fixed_160",
         preferred_coverage: float = 0.4,
         scene_ids: Optional[List[str]] = None,
+        fixed_chunk: bool = False,
+        fixed_sample: Optional[Dict] = None,
     ) -> None:
         self.num_samples_per_epoch = int(num_samples_per_epoch)
         self._worker_seed: Optional[int] = None
-        self.sampler = ASEOnlineChunkSampler(
-            cache_root=cache_root,
-            chunk_size=chunk_size,
-            occupancy_threshold=occupancy_threshold,
-            max_candidate_chunks=max_candidate_chunks,
-            top_k_cameras=top_k_cameras,
-            seed=seed,
-            z_mode=z_mode,
-            preferred_coverage=preferred_coverage,
-            scene_ids=scene_ids,
+        self.fixed_chunk = bool(fixed_chunk or fixed_sample is not None)
+        self._fixed_sample: Optional[Dict] = (
+            copy.deepcopy(fixed_sample) if fixed_sample is not None else None
         )
+        self.sampler = None
+        if self._fixed_sample is None:
+            self.sampler = ASEOnlineChunkSampler(
+                cache_root=cache_root,
+                chunk_size=chunk_size,
+                occupancy_threshold=occupancy_threshold,
+                max_candidate_chunks=max_candidate_chunks,
+                top_k_cameras=top_k_cameras,
+                seed=seed,
+                z_mode=z_mode,
+                preferred_coverage=preferred_coverage,
+                scene_ids=scene_ids,
+            )
+        if self.fixed_chunk and self._fixed_sample is None:
+            self._fixed_sample = self.sampler.sample()
 
     def __len__(self) -> int:
         return self.num_samples_per_epoch
@@ -51,6 +62,9 @@ class ASEChunkDataset:
         if worker_info is None:
             return
 
+        if self.sampler is None:
+            return
+
         worker_seed = int(worker_info.seed % (2**32))
         if self._worker_seed != worker_seed:
             self.sampler.set_seed(worker_seed)
@@ -58,8 +72,11 @@ class ASEChunkDataset:
 
     def __getitem__(self, idx: int) -> Dict:
         del idx
-        self._maybe_seed_worker()
-        sample = self.sampler.sample()
+        if self._fixed_sample is None:
+            self._maybe_seed_worker()
+            sample = self.sampler.sample()
+        else:
+            sample = copy.deepcopy(self._fixed_sample)
         sample["metadata"] = {
             "scene_id": sample["scene_id"],
             "ply_path": sample["ply_path"],
@@ -79,3 +96,25 @@ class ASEChunkDataset:
             "best_candidate_occupancy": sample["best_candidate_occupancy"],
         }
         return sample
+
+    def fixed_sample(self) -> Optional[Dict]:
+        """Return the cached fixed chunk sample, if fixed chunk training is enabled."""
+
+        if self._fixed_sample is None:
+            return None
+        return copy.deepcopy(self._fixed_sample)
+
+    def fixed_chunk_summary(self) -> Optional[str]:
+        """Human-readable description of the fixed chunk used by this dataset."""
+
+        if self._fixed_sample is None:
+            return None
+        sample = self._fixed_sample
+        return (
+            f"scene_id={sample['scene_id']} "
+            f"chunk_min={sample['chunk_min_voxel'].tolist()} "
+            f"chunk_max={sample['chunk_max_voxel'].tolist()} "
+            f"shape={sample['chunk_shape_voxels'].tolist()} "
+            f"occupancy={float(sample['occupancy']):.6f} "
+            f"accepted={bool(sample['accepted_by_threshold'])}"
+        )
