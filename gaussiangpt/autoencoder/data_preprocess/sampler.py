@@ -44,11 +44,37 @@ def _zero_camera_score(frame: Dict) -> Dict:
     }
 
 
+def _attach_camera_pose(score: Dict, frame: Dict, cameras: ASECameras) -> Dict:
+    """Attach pose/intrinsics when training will render from scored ASE views."""
+
+    c2w = frame.get("c2w", frame.get("transform_matrix"))
+    if c2w is None:
+        return score
+    c2w = np.asarray(c2w, dtype=np.float32)
+    w2c = frame.get("w2c")
+    if w2c is None:
+        w2c = np.linalg.inv(c2w).astype(np.float32)
+    score.update(
+        {
+            "c2w": c2w.astype(np.float32, copy=True),
+            "w2c": np.asarray(w2c, dtype=np.float32).astype(np.float32, copy=True),
+            "width": int(cameras.width),
+            "height": int(cameras.height),
+            "fx": float(cameras.fx),
+            "fy": float(cameras.fy),
+            "cx": float(cameras.cx),
+            "cy": float(cameras.cy),
+        }
+    )
+    return score
+
+
 def score_cameras_for_chunk(
     cameras: ASECameras,
     chunk_world_min: np.ndarray,
     chunk_world_max: np.ndarray,
     top_k: int = 12,
+    include_camera_matrices: bool = False,
 ) -> List[Dict]:
     """Score cameras by projected chunk bbox overlap with the image plane.
 
@@ -82,6 +108,8 @@ def score_cameras_for_chunk(
                 zero_score = _zero_camera_score(frame)
                 zero_score["depth_min"] = depth_min
                 zero_score["depth_max"] = depth_max
+                if include_camera_matrices:
+                    zero_score = _attach_camera_pose(zero_score, frame, cameras)
                 scores.append(zero_score)
                 continue
 
@@ -94,6 +122,8 @@ def score_cameras_for_chunk(
                 zero_score["depth_min"] = depth_min
                 zero_score["depth_max"] = depth_max
                 zero_score["near_plane_crossing"] = near_plane_crossing
+                if include_camera_matrices:
+                    zero_score = _attach_camera_pose(zero_score, frame, cameras)
                 scores.append(zero_score)
                 continue
             u = u[finite]
@@ -120,6 +150,8 @@ def score_cameras_for_chunk(
                 zero_score["depth_min"] = depth_min
                 zero_score["depth_max"] = depth_max
                 zero_score["near_plane_crossing"] = near_plane_crossing
+                if include_camera_matrices:
+                    zero_score = _attach_camera_pose(zero_score, frame, cameras)
                 scores.append(zero_score)
                 continue
 
@@ -135,29 +167,33 @@ def score_cameras_for_chunk(
                 float(intersection_area / image_area) if image_area > 0.0 else 0.0
             )
 
-            scores.append(
-                {
-                    "camera_id": frame.get("camera_id"),
-                    "frame_index": frame.get("frame_index"),
-                    "frame_id": frame.get("frame_id"),
-                    "file_path": frame.get("file_path"),
-                    "chunk_coverage": chunk_coverage,
-                    "image_coverage": image_coverage,
-                    "visible_ratio": visible_ratio,
-                    "visible_corners": visible_corners,
-                    "total_corners": total_corners,
-                    "valid_projection": True,
-                    "projected_bbox": projected_bbox,
-                    "projected_bbox_area": float(projected_bbox_area),
-                    "intersection_area": float(intersection_area),
-                    "depth_min": depth_min,
-                    "depth_max": depth_max,
-                    "near_plane_crossing": near_plane_crossing,
-                    "selection_mode": None,
-                }
-            )
+            score = {
+                "camera_id": frame.get("camera_id"),
+                "frame_index": frame.get("frame_index"),
+                "frame_id": frame.get("frame_id"),
+                "file_path": frame.get("file_path"),
+                "chunk_coverage": chunk_coverage,
+                "image_coverage": image_coverage,
+                "visible_ratio": visible_ratio,
+                "visible_corners": visible_corners,
+                "total_corners": total_corners,
+                "valid_projection": True,
+                "projected_bbox": projected_bbox,
+                "projected_bbox_area": float(projected_bbox_area),
+                "intersection_area": float(intersection_area),
+                "depth_min": depth_min,
+                "depth_max": depth_max,
+                "near_plane_crossing": near_plane_crossing,
+                "selection_mode": None,
+            }
+            if include_camera_matrices:
+                score = _attach_camera_pose(score, frame, cameras)
+            scores.append(score)
         except Exception:
-            scores.append(_zero_camera_score(frame))
+            zero_score = _zero_camera_score(frame)
+            if include_camera_matrices:
+                zero_score = _attach_camera_pose(zero_score, frame, cameras)
+            scores.append(zero_score)
 
     return sorted(
         scores,
@@ -176,6 +212,7 @@ def select_cameras_for_chunk(
     chunk_world_max: np.ndarray,
     top_k: int = 12,
     preferred_coverage: float = 0.4,
+    include_camera_matrices: bool = False,
 ) -> List[Dict]:
     """Select cameras for a chunk and annotate why each camera was selected."""
 
@@ -184,6 +221,7 @@ def select_cameras_for_chunk(
         chunk_world_min,
         chunk_world_max,
         top_k=len(cameras.frames),
+        include_camera_matrices=include_camera_matrices,
     )
     preferred = [
         dict(score, selection_mode="preferred")
@@ -252,6 +290,7 @@ class ASEOnlineChunkSampler:
         seed: int = 42,
         z_mode: str = "fixed_160",
         preferred_coverage: float = 0.4,
+        include_camera_matrices: bool = False,
         scene_id: Optional[str] = None,
         scene_ids: Optional[List[str]] = None,
     ) -> None:
@@ -285,6 +324,7 @@ class ASEOnlineChunkSampler:
         self.z_mode = z_mode
         self.scene_ids = selected_scene_ids
         self.preferred_coverage = float(preferred_coverage)
+        self.include_camera_matrices = bool(include_camera_matrices)
         self.rng = np.random.RandomState(self.seed)
         if self.z_mode not in {"fixed_160", "full_height"}:
             raise ValueError("z_mode must be 'fixed_160' or 'full_height'")
@@ -429,6 +469,7 @@ class ASEOnlineChunkSampler:
             chunk_world_max,
             top_k=self.top_k_cameras,
             preferred_coverage=self.preferred_coverage,
+            include_camera_matrices=self.include_camera_matrices,
         )
 
         return {

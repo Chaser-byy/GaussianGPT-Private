@@ -151,6 +151,34 @@ def make_camera(
     )
 
 
+def make_camera_from_world_to_camera(
+    world_to_camera: torch.Tensor,
+    fovx: float,
+    fovy: float,
+    image_height: int,
+    image_width: int,
+    znear: float = 0.01,
+    zfar: float = 100.0,
+) -> MiniCam:
+    """Build a MiniCam from an ASE/COLMAP-style row-major world-to-camera matrix."""
+
+    w2v_t = world_to_camera.to(dtype=torch.float32).t().contiguous()
+    proj_t = projection_matrix(znear, zfar, fovx, fovy, device=w2v_t.device)
+    full_t = w2v_t @ proj_t
+    cam_center = torch.linalg.inv(w2v_t)[3, :3]
+    return MiniCam(
+        image_height=int(image_height),
+        image_width=int(image_width),
+        fovx=float(fovx),
+        fovy=float(fovy),
+        znear=float(znear),
+        zfar=float(zfar),
+        world_view_transform=w2v_t,
+        full_proj_transform=full_t,
+        camera_center=cam_center,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Camera sampling around a scene bounding box.
 # --------------------------------------------------------------------------- #

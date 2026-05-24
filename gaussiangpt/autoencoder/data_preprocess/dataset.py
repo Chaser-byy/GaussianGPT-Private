@@ -23,6 +23,7 @@ class ASEChunkDataset:
         seed: int = 42,
         z_mode: str = "fixed_160",
         preferred_coverage: float = 0.4,
+        include_camera_matrices: bool = False,
         scene_ids: Optional[List[str]] = None,
         fixed_chunk: bool = False,
         fixed_sample: Optional[Dict] = None,
@@ -44,6 +45,7 @@ class ASEChunkDataset:
                 seed=seed,
                 z_mode=z_mode,
                 preferred_coverage=preferred_coverage,
+                include_camera_matrices=include_camera_matrices,
                 scene_ids=scene_ids,
             )
         if self.fixed_chunk and self._fixed_sample is None:

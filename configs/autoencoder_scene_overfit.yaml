@@ -57,6 +57,15 @@ loss:
   # 单 chunk 过拟合时建议先关 jitter，让 render target 也固定。
   camera_jitter: 0.0
 
+camera_sampling:
+  mode: "orbit"             # "orbit" keeps the existing bbox orbit cameras; "scoring" enables GaussianGPT chunk-conditioned sampling.
+  num_views: null           # scoring only; null falls back to loss.n_images
+  num_candidates: null      # scoring only; null uses 8 * num_views per GaussianGPT Appendix C
+  temperature: 1.0
+  score_key: "chunk_coverage"
+  seed: null
+  log_every: 100
+
 training:
   epochs: 6000
   batch_size: 1

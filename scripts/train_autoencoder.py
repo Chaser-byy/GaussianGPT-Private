@@ -10,6 +10,7 @@ Paper training details:
 """
 import os
 import argparse
+import math
 import yaml
 from typing import Optional
 
@@ -30,6 +31,7 @@ from gaussiangpt.autoencoder.diagnostics import ColorClampDiagnostics
 from gaussiangpt.data import GaussianSceneDataset
 from gaussiangpt.utils.rendering import (
     HAS_RASTERIZER,
+    make_camera_from_world_to_camera,
     sample_cameras_around_bbox,
     render_gaussians,
 )
@@ -84,6 +86,259 @@ def _build_world_positions(
     return voxel_centers + pred_offset
 
 
+def _camera_sampling_config(cfg: dict) -> tuple:
+    camera_cfg = cfg.get("camera_sampling", {}) or {}
+    mode = str(camera_cfg.get("mode", "orbit")).lower()
+    if mode in {"default", "orbit", "around_bbox", "bbox"}:
+        mode = "orbit"
+    elif mode in {"score", "scored", "scoring", "gaussiangpt"}:
+        mode = "scoring"
+    else:
+        raise ValueError(
+            "camera_sampling.mode must be 'orbit' or 'scoring', "
+            f"got {mode!r}"
+        )
+    return camera_cfg, mode
+
+
+def _effective_render_view_count(cfg: dict, loss_cfg: Optional[dict] = None) -> int:
+    loss_cfg = cfg.get("loss", {}) if loss_cfg is None else loss_cfg
+    n_views = int(loss_cfg.get("n_images", 0))
+    camera_cfg, mode = _camera_sampling_config(cfg)
+    if mode == "scoring" and camera_cfg.get("num_views") is not None:
+        n_views = int(camera_cfg["num_views"])
+    return n_views
+
+
+def _camera_candidate_count(cfg: dict, n_views: int) -> int:
+    camera_cfg, _mode = _camera_sampling_config(cfg)
+    if camera_cfg.get("num_candidates") is not None:
+        return int(camera_cfg["num_candidates"])
+    return max(1, 8 * max(1, int(n_views)))
+
+
+def _camera_score_key(cfg: dict) -> str:
+    camera_cfg, _mode = _camera_sampling_config(cfg)
+    return str(camera_cfg.get("score_key", "chunk_coverage"))
+
+
+def _camera_candidates_from_sample(sample: dict) -> list:
+    meta = sample.get("metadata", {}) or {}
+    candidates = meta.get("top_cameras")
+    if candidates is None:
+        candidates = (meta.get("camera_debug", {}) or {}).get("top_cameras", [])
+    return list(candidates or [])
+
+
+def _camera_candidate_signature(candidates: list, score_key: str) -> tuple:
+    signature = []
+    for item in candidates:
+        score = item.get(score_key, item.get("chunk_coverage", 0.0))
+        try:
+            score_value = round(float(score), 6)
+        except (TypeError, ValueError):
+            score_value = 0.0
+        signature.append(
+            (
+                str(item.get("camera_id", "")),
+                int(item.get("frame_index", item.get("frame_id", -1)) or -1),
+                score_value,
+            )
+        )
+    return tuple(signature)
+
+
+def _scored_camera_to_minicam(
+    camera_info: dict,
+    image_size: int,
+    fallback_fov_deg: float,
+    device: torch.device,
+):
+    world_to_camera = torch.as_tensor(
+        np.asarray(camera_info["w2c"], dtype=np.float32),
+        dtype=torch.float32,
+        device=device,
+    )
+    width = float(camera_info.get("width", image_size))
+    height = float(camera_info.get("height", image_size))
+    fx = float(camera_info.get("fx", 0.0))
+    fy = float(camera_info.get("fy", 0.0))
+    fallback_fov = math.radians(float(fallback_fov_deg))
+    fovx = 2.0 * math.atan(width / max(2.0 * fx, 1e-8)) if fx > 0 else fallback_fov
+    fovy = 2.0 * math.atan(height / max(2.0 * fy, 1e-8)) if fy > 0 else fallback_fov
+    return make_camera_from_world_to_camera(
+        world_to_camera=world_to_camera,
+        fovx=fovx,
+        fovy=fovy,
+        image_height=image_size,
+        image_width=image_size,
+    )
+
+
+def _camera_sampling_generator(
+    cfg: dict,
+    sample: dict,
+    device: torch.device,
+    rng: Optional[torch.Generator],
+    global_step: Optional[int],
+) -> Optional[torch.Generator]:
+    camera_cfg, _mode = _camera_sampling_config(cfg)
+    seed_value = camera_cfg.get("seed")
+    if seed_value is None:
+        return rng
+
+    meta = sample.get("metadata", {}) or {}
+    seed = int(seed_value) + int(global_step or 0) * 1_000_003
+    for char in str(meta.get("scene_id", "")):
+        seed = (seed * 33 + ord(char)) % (2**63 - 1)
+    chunk = meta.get("chunk_min_voxel", sample.get("chunk_origin", [0, 0, 0]))
+    if torch.is_tensor(chunk):
+        chunk = chunk.detach().cpu().tolist()
+    for idx, value in enumerate(chunk):
+        seed = (seed * 1009 + (idx + 1) * int(value)) % (2**63 - 1)
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    return generator
+
+
+def _sample_scored_cameras(
+    sample: dict,
+    cfg: dict,
+    n_views: int,
+    image_size: int,
+    fallback_fov_deg: float,
+    device: torch.device,
+    rng: Optional[torch.Generator],
+    global_step: Optional[int],
+) -> tuple:
+    """Sample ASE cameras proportionally to GaussianGPT-style chunk scores."""
+
+    camera_cfg, _mode = _camera_sampling_config(cfg)
+    score_key = _camera_score_key(cfg)
+    temperature = max(float(camera_cfg.get("temperature", 1.0)), 1e-6)
+    raw_candidates = _camera_candidates_from_sample(sample)
+    candidates = [item for item in raw_candidates if "w2c" in item]
+    debug = {
+        "source": "scoring",
+        "score_key": score_key,
+        "candidate_count": len(raw_candidates),
+        "usable_candidate_count": len(candidates),
+        "sampled_count": 0,
+        "fallback": None,
+    }
+    if not candidates:
+        debug["fallback"] = "missing_camera_pose_or_candidates"
+        return [], debug
+
+    score_values = []
+    for item in candidates:
+        score = item.get(score_key, item.get("chunk_coverage", 0.0))
+        try:
+            score = float(score)
+        except (TypeError, ValueError):
+            score = 0.0
+        if not math.isfinite(score) or score < 0.0:
+            score = 0.0
+        score_values.append(score)
+
+    scores = torch.tensor(score_values, dtype=torch.float32, device=device)
+    score_min = float(scores.min().detach().item())
+    score_max = float(scores.max().detach().item())
+    score_mean = float(scores.mean().detach().item())
+
+    if score_max <= 0.0:
+        probs = torch.full_like(scores, 1.0 / float(scores.numel()))
+        debug["fallback"] = "invalid_scores_uniform"
+    elif torch.allclose(scores, torch.full_like(scores, score_mean), rtol=1e-6, atol=1e-12):
+        probs = torch.full_like(scores, 1.0 / float(scores.numel()))
+        debug["fallback"] = "equal_scores_uniform"
+    else:
+        # GaussianGPT samples proportionally to the chunk-view score. A
+        # temperature on log(score) keeps temperature=1 exactly score
+        # proportional while allowing flatter or sharper distributions.
+        probs = torch.softmax(torch.log(scores.clamp_min(1e-12)) / temperature, dim=0)
+
+    replacement = int(n_views) > len(candidates)
+    if replacement:
+        debug["fallback"] = (
+            f"{debug['fallback']}+replacement"
+            if debug["fallback"]
+            else "candidate_count_lt_num_views_replacement"
+        )
+    generator = _camera_sampling_generator(cfg, sample, device, rng, global_step)
+    sampled = torch.multinomial(
+        probs,
+        int(n_views),
+        replacement=replacement,
+        generator=generator,
+    )
+    sampled_indices = [int(value) for value in sampled.detach().cpu().tolist()]
+    selected = [candidates[index] for index in sampled_indices]
+    cameras = [
+        _scored_camera_to_minicam(item, image_size, fallback_fov_deg, device)
+        for item in selected
+    ]
+
+    prob_min = float(probs.min().detach().item())
+    prob_max = float(probs.max().detach().item())
+    entropy = float((-(probs * torch.log(probs.clamp_min(1e-12))).sum()).detach().item())
+    debug.update(
+        {
+            "sampled_count": len(cameras),
+            "sampled_indices": sampled_indices,
+            "sampled_frame_indices": [
+                int(item.get("frame_index", item.get("frame_id", -1)) or -1)
+                for item in selected
+            ],
+            "sampled_camera_ids": [str(item.get("camera_id", "")) for item in selected],
+            "score_min": score_min,
+            "score_max": score_max,
+            "score_mean": score_mean,
+            "prob_min": prob_min,
+            "prob_max": prob_max,
+            "prob_entropy": entropy,
+            "temperature": temperature,
+        }
+    )
+    return cameras, debug
+
+
+def _should_log_camera_sampling(cfg: dict, global_step: Optional[int]) -> bool:
+    camera_cfg, mode = _camera_sampling_config(cfg)
+    if mode != "scoring":
+        return False
+    if global_step is None:
+        return False
+    every = int(camera_cfg.get("log_every", 100))
+    return int(global_step) == 1 or (every > 0 and int(global_step) % every == 0)
+
+
+def _log_camera_sampling(sample: dict, global_step: int, debug: dict) -> None:
+    meta = sample.get("metadata", {}) or {}
+    chunk = meta.get("chunk_min_voxel", sample.get("chunk_origin", None))
+    if torch.is_tensor(chunk):
+        chunk = chunk.detach().cpu().tolist()
+    print(
+        "  [camera sampling] "
+        f"step={global_step} mode=scoring scene={meta.get('scene_id', '')} "
+        f"chunk_min={chunk} source={debug.get('source')} "
+        f"candidates={debug.get('usable_candidate_count', 0)}/"
+        f"{debug.get('candidate_count', 0)} "
+        f"sampled={debug.get('sampled_count', 0)} "
+        f"score_key={debug.get('score_key')} "
+        f"score={debug.get('score_min', 0.0):.4g}/"
+        f"{debug.get('score_mean', 0.0):.4g}/"
+        f"{debug.get('score_max', 0.0):.4g} "
+        f"prob={debug.get('prob_min', 0.0):.4g}/"
+        f"{debug.get('prob_max', 0.0):.4g} "
+        f"entropy={debug.get('prob_entropy', 0.0):.4g} "
+        f"indices={debug.get('sampled_indices', [])} "
+        f"frames={debug.get('sampled_frame_indices', [])} "
+        f"fallback={debug.get('fallback')}"
+    )
+
+
 def _render_loss_for_sample(
     sample: dict,
     pred_gaussians: dict,
@@ -93,6 +348,7 @@ def _render_loss_for_sample(
     perceptual: nn.Module = None,
     rng: torch.Generator = None,
     gt_render_cache: Optional[dict] = None,
+    global_step: Optional[int] = None,
 ) -> tuple:
     """Render N views of GT and predicted Gaussians; return (l_rgb, l_perc).
 
@@ -104,7 +360,8 @@ def _render_loss_for_sample(
         return zero, zero
 
     loss_cfg = cfg.get("loss", {})
-    n_views = int(loss_cfg.get("n_images", 0))
+    camera_cfg, camera_mode = _camera_sampling_config(cfg)
+    n_views = _effective_render_view_count(cfg, loss_cfg)
     img_size = int(loss_cfg.get("render_size", 128))
     if n_views <= 0:
         zero = torch.zeros((), device=device)
@@ -147,10 +404,14 @@ def _render_loss_for_sample(
     radius_factor = float(loss_cfg.get("radius_factor", 1.5))
     upper_hemisphere_only = bool(loss_cfg.get("upper_hemisphere_only", False))
     camera_jitter = float(loss_cfg.get("camera_jitter", 0.0))
+    score_key = _camera_score_key(cfg)
+    candidates = _camera_candidates_from_sample(sample)
+    camera_debug = None
     cache_key = None
     cameras = None
     cached_gt_imgs = None
-    if gt_render_cache is not None and camera_jitter == 0.0:
+    cacheable_cameras = camera_mode == "scoring" or camera_jitter == 0.0
+    if gt_render_cache is not None and cacheable_cameras:
         meta = sample.get("metadata", {})
         chunk_origin_value = meta.get("chunk_min_voxel", sample.get("chunk_origin"))
         if torch.is_tensor(chunk_origin_value):
@@ -166,29 +427,63 @@ def _render_loss_for_sample(
             float(fov_deg),
             float(radius_factor),
             bool(upper_hemisphere_only),
+            str(camera_mode),
+            int(_camera_candidate_count(cfg, n_views)) if camera_mode == "scoring" else 0,
+            float(camera_cfg.get("temperature", 1.0)) if camera_mode == "scoring" else 0.0,
+            str(score_key) if camera_mode == "scoring" else "",
+            _camera_candidate_signature(candidates, score_key)
+            if camera_mode == "scoring"
+            else (),
         )
         cached = gt_render_cache.get(cache_key)
         if cached is not None:
             cameras = cached["cameras"]
             cached_gt_imgs = cached["gt_imgs"]
+            camera_debug = dict(cached.get("camera_debug", {}))
+            if camera_debug:
+                camera_debug["source"] = "gt_render_cache"
 
     if cameras is None:
-        # Camera sphere is sized from the GT bbox so the views naturally cover
-        # the scene as it gets reconstructed.
         bbox_min = gt_position.min(dim=0).values.detach()
         bbox_max = gt_position.max(dim=0).values.detach()
-        cameras = sample_cameras_around_bbox(
-            bbox_min=bbox_min,
-            bbox_max=bbox_max,
-            n_views=n_views,
-            image_height=img_size,
-            image_width=img_size,
-            fov_deg=fov_deg,
-            radius_factor=radius_factor,
-            upper_hemisphere_only=upper_hemisphere_only,
-            jitter=camera_jitter,
-            rng=rng,
-        )
+        if camera_mode == "scoring":
+            cameras, camera_debug = _sample_scored_cameras(
+                sample=sample,
+                cfg=cfg,
+                n_views=n_views,
+                image_size=img_size,
+                fallback_fov_deg=fov_deg,
+                device=device,
+                rng=rng,
+                global_step=global_step,
+            )
+        if not cameras:
+            if camera_mode == "scoring":
+                if camera_debug is None:
+                    camera_debug = {}
+                camera_debug["source"] = "orbit_fallback"
+            # Camera sphere is sized from the GT bbox so the views naturally
+            # cover the scene as it gets reconstructed. This is the original
+            # orbit path and remains the default behavior.
+            cameras = sample_cameras_around_bbox(
+                bbox_min=bbox_min,
+                bbox_max=bbox_max,
+                n_views=n_views,
+                image_height=img_size,
+                image_width=img_size,
+                fov_deg=fov_deg,
+                radius_factor=radius_factor,
+                upper_hemisphere_only=upper_hemisphere_only,
+                jitter=camera_jitter,
+                rng=rng,
+            )
+
+    if (
+        camera_mode == "scoring"
+        and camera_debug is not None
+        and _should_log_camera_sampling(cfg, global_step)
+    ):
+        _log_camera_sampling(sample, int(global_step), camera_debug)
 
     l_rgb = torch.zeros((), device=device)
     l_perc = torch.zeros((), device=device)
@@ -212,6 +507,7 @@ def _render_loss_for_sample(
         gt_render_cache[cache_key] = {
             "cameras": cameras,
             "gt_imgs": tuple(gt_imgs_to_cache),
+            "camera_debug": camera_debug,
         }
 
     l_rgb = l_rgb / float(n_views)
@@ -519,7 +815,8 @@ def compute_batch_loss(
             # 注意：传入单样本的相机或场景参数，可以从 batch["metas"][meta_idx] 中灵活读取
             single_rgb, single_perc = _render_loss_for_sample(
                 meta_sample, sample_pred, sample_gt, cfg, device,
-                perceptual=perceptual, rng=rng, gt_render_cache=gt_render_cache
+                perceptual=perceptual, rng=rng, gt_render_cache=gt_render_cache,
+                global_step=global_step,
             )
             l_rgb = l_rgb + single_rgb
             l_perc = l_perc + single_perc
@@ -711,7 +1008,8 @@ def save_validation_reconstruction(
         return
 
     loss_cfg = cfg.get("loss", {})
-    n_views = int(loss_cfg.get("n_images", 0))
+    camera_cfg, camera_mode = _camera_sampling_config(cfg)
+    n_views = _effective_render_view_count(cfg, loss_cfg)
     img_size = int(loss_cfg.get("render_size", 128))
     if n_views <= 0:
         return
@@ -721,19 +1019,32 @@ def save_validation_reconstruction(
     gt_position = voxel_centers + gaussians["offset"]
     bbox_min = gt_position.min(dim=0).values
     bbox_max = gt_position.max(dim=0).values
-    # Validation views are deterministic (no jitter) so renderings are
-    # directly comparable across val runs.
-    cameras = sample_cameras_around_bbox(
-        bbox_min=bbox_min,
-        bbox_max=bbox_max,
-        n_views=n_views,
-        image_height=img_size,
-        image_width=img_size,
-        fov_deg=float(loss_cfg.get("fov_deg", 60.0)),
-        radius_factor=float(loss_cfg.get("radius_factor", 1.5)),
-        upper_hemisphere_only=bool(loss_cfg.get("upper_hemisphere_only", False)),
-        jitter=0.0,
-    )
+    cameras = []
+    if camera_mode == "scoring":
+        cameras, _camera_debug = _sample_scored_cameras(
+            sample=sample,
+            cfg=cfg,
+            n_views=n_views,
+            image_size=img_size,
+            fallback_fov_deg=float(loss_cfg.get("fov_deg", 60.0)),
+            device=device,
+            rng=None,
+            global_step=None,
+        )
+    if not cameras:
+        # Validation orbit views are deterministic (no jitter) so renderings
+        # are directly comparable across val runs.
+        cameras = sample_cameras_around_bbox(
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+            n_views=n_views,
+            image_height=img_size,
+            image_width=img_size,
+            fov_deg=float(loss_cfg.get("fov_deg", 60.0)),
+            radius_factor=float(loss_cfg.get("radius_factor", 1.5)),
+            upper_hemisphere_only=bool(loss_cfg.get("upper_hemisphere_only", False)),
+            jitter=0.0,
+        )
 
     bg = torch.zeros(3, device=device)
     gt_pack = {
@@ -825,7 +1136,11 @@ def validate(
     )
     if saved_reconstruction:
         print(f"Saved validation reconstruction: {recon_path}")
-        if HAS_RASTERIZER and device.type == "cuda" and int(cfg.get("loss", {}).get("n_images", 0)) > 0:
+        if (
+            HAS_RASTERIZER
+            and device.type == "cuda"
+            and _effective_render_view_count(cfg, cfg.get("loss", {})) > 0
+        ):
             print(f"Saved validation renderings:     {image_path}")
     return avg_loss
 
@@ -901,6 +1216,21 @@ def train(cfg: dict, args):
     preferred_coverage = float(data_cfg.get("preferred_coverage", 0.4))
     train_scene_ids = data_cfg.get("train_scene_ids")
     val_scene_ids = data_cfg.get("val_scene_ids")
+    loss_cfg = cfg.get("loss", {})
+    camera_cfg, camera_mode = _camera_sampling_config(cfg)
+    render_n_views = _effective_render_view_count(cfg, loss_cfg)
+    camera_num_candidates = _camera_candidate_count(cfg, render_n_views)
+    include_camera_matrices = camera_mode == "scoring"
+    sampler_top_k_cameras = top_k_cameras
+    if camera_mode == "scoring":
+        sampler_top_k_cameras = max(int(camera_num_candidates), int(render_n_views))
+    print(
+        "[camera sampling] "
+        f"mode={camera_mode} render_views={render_n_views} "
+        f"candidate_cameras={sampler_top_k_cameras} "
+        f"score_key={_camera_score_key(cfg)} "
+        f"temperature={camera_cfg.get('temperature', 1.0)}"
+    )
 
     train_dataset = ASEChunkDataset(
         cache_root=cache_root,
@@ -908,10 +1238,11 @@ def train(cfg: dict, args):
         chunk_size=chunk_size_world,
         occupancy_threshold=occupancy_threshold,
         max_candidate_chunks=max_candidate_chunks,
-        top_k_cameras=top_k_cameras,
+        top_k_cameras=sampler_top_k_cameras,
         seed=int(data_cfg.get("seed", 42)),
         z_mode=z_mode,
         preferred_coverage=preferred_coverage,
+        include_camera_matrices=include_camera_matrices,
         scene_ids=train_scene_ids,
         fixed_chunk=fixed_chunk,
     )
@@ -924,10 +1255,11 @@ def train(cfg: dict, args):
         chunk_size=chunk_size_world,
         occupancy_threshold=occupancy_threshold,
         max_candidate_chunks=max_candidate_chunks,
-        top_k_cameras=top_k_cameras,
+        top_k_cameras=sampler_top_k_cameras,
         seed=int(data_cfg.get("val_seed", 4242)),
         z_mode=z_mode,
         preferred_coverage=preferred_coverage,
+        include_camera_matrices=include_camera_matrices,
         scene_ids=val_scene_ids,
         fixed_chunk=fixed_chunk,
         fixed_sample=fixed_sample,
@@ -1045,11 +1377,10 @@ def train(cfg: dict, args):
     # Lazily build the VGG perceptual loss only when actually requested,
     # so that disabling it (lambda_perc=0 or n_images=0) avoids loading
     # ~80MB of weights and an extra GPU-side module.
-    loss_cfg = cfg.get("loss", {})
     use_render = (
         float(loss_cfg.get("lambda_rgb", 0.0)) > 0.0
         or float(loss_cfg.get("lambda_perc", 0.0)) > 0.0
-    ) and int(loss_cfg.get("n_images", 0)) > 0
+    ) and render_n_views > 0
     perceptual = None
     if use_render:
         if not HAS_RASTERIZER:
@@ -1060,7 +1391,7 @@ def train(cfg: dict, args):
         else:
             print(
                 f"Rendering supervision enabled: "
-                f"n_views={loss_cfg.get('n_images')} "
+                f"n_views={render_n_views} "
                 f"img={loss_cfg.get('render_size', 128)}^2 "
                 f"lambda_rgb={loss_cfg.get('lambda_rgb', 0.0)} "
                 f"lambda_perc={loss_cfg.get('lambda_perc', 0.0)}"
@@ -1077,12 +1408,15 @@ def train(cfg: dict, args):
         and use_render
         and HAS_RASTERIZER
         and device.type == "cuda"
-        and float(loss_cfg.get("camera_jitter", 0.0)) == 0.0
+        and (
+            camera_mode == "scoring"
+            or float(loss_cfg.get("camera_jitter", 0.0)) == 0.0
+        )
         and bool(loss_cfg.get("cache_fixed_gt_render", True))
     )
     gt_render_cache = {} if cache_fixed_gt_render else None
     if cache_fixed_gt_render:
-        print("[fixed_chunk] GT render cache enabled (camera_jitter=0.0)")
+        print(f"[fixed_chunk] GT render cache enabled (camera_sampling={camera_mode})")
     elif fixed_chunk and use_render:
         print("[fixed_chunk] GT render cache disabled")
 
