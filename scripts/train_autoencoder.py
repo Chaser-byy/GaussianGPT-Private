@@ -153,6 +153,69 @@ def _effective_render_view_count(cfg: dict, loss_cfg: Optional[dict] = None) -> 
     return n_views
 
 
+def _validation_pruning_config(cfg: dict) -> dict:
+    validation_cfg = cfg.get("validation", {}) or {}
+    occ_threshold = validation_cfg.get(
+        "occ_threshold",
+        validation_cfg.get("occupancy_threshold", 0.5),
+    )
+    prune_min_keep = validation_cfg.get(
+        "prune_min_keep",
+        validation_cfg.get("min_keep", 1),
+    )
+    return {
+        "prune": bool(validation_cfg.get("prune", False)),
+        "occ_threshold": float(occ_threshold),
+        "prune_min_keep": int(prune_min_keep),
+    }
+
+
+def _count_coords_by_sample(coords: Optional[torch.Tensor], n_samples: int) -> list:
+    if coords is None or coords.numel() == 0:
+        return [0 for _ in range(n_samples)]
+    if coords.dim() == 2 and coords.shape[1] >= 4:
+        batch_index = coords[:, 0].detach().long().cpu()
+        counts = torch.bincount(batch_index, minlength=n_samples)
+        return [int(v) for v in counts[:n_samples].tolist()]
+    return [int(coords.shape[0])] + [0 for _ in range(max(n_samples - 1, 0))]
+
+
+def _decoder_pre_prune_counts(occ_list: list, fallback_counts: list, n_samples: int) -> list:
+    if not occ_list:
+        return fallback_counts
+    last_occ = occ_list[-1]
+    if hasattr(last_occ, "C"):
+        return _count_coords_by_sample(last_occ.C, n_samples)
+    if torch.is_tensor(last_occ) and last_occ.dim() >= 5:
+        batch_count = min(int(last_occ.shape[0]), n_samples)
+        counts = [int(last_occ[i].numel()) for i in range(batch_count)]
+        counts.extend([0 for _ in range(n_samples - batch_count)])
+        return counts
+    return fallback_counts
+
+
+def _log_validation_pruning_counts(
+    batch: dict,
+    gt_coords: torch.Tensor,
+    pred_coords: torch.Tensor,
+    occ_list: list,
+    prune: bool,
+    log_prefix: str,
+) -> None:
+    n_samples = len(batch.get("metas", [])) or 1
+    gt_counts = _count_coords_by_sample(gt_coords, n_samples)
+    post_counts = _count_coords_by_sample(pred_coords, n_samples)
+    pre_counts = _decoder_pre_prune_counts(occ_list, post_counts, n_samples) if prune else post_counts
+    mode = "pruned" if prune else "unpruned"
+    for sample_idx in range(n_samples):
+        print(
+            f"  [{log_prefix} pruning] sample={sample_idx} "
+            f"mode={mode} gt_voxels={gt_counts[sample_idx]} "
+            f"pre_voxels={pre_counts[sample_idx]} post_voxels={post_counts[sample_idx]} "
+            f"pre_gaussians={pre_counts[sample_idx]} post_gaussians={post_counts[sample_idx]}"
+        )
+
+
 def _camera_candidate_count(cfg: dict, n_views: int) -> Optional[int]:
     camera_cfg, mode = _camera_sampling_config(cfg)
     if camera_cfg.get("num_candidates") is not None:
@@ -789,6 +852,11 @@ def compute_batch_loss(
     rng: torch.Generator = None,
     gt_render_cache: Optional[dict] = None,
     global_step: Optional[int] = None,
+    decoder_prune: bool = False,
+    occupancy_threshold: float = 0.5,
+    prune_min_keep: int = 1,
+    log_pruning: bool = False,
+    log_prefix: str = "validation",
 ):
     from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
 
@@ -818,10 +886,25 @@ def compute_batch_loss(
     }
 
     # 3. 彻底告别 for 循环！整个 Batch 放入 Sparse CNN 一把梭完成前向推理
-    pred_gaussians, occ_list, lfq_loss, indices = raw_model(gaussians, coords)
+    pred_gaussians, occ_list, lfq_loss, indices = raw_model(
+        gaussians,
+        coords,
+        prune=decoder_prune,
+        occupancy_threshold=occupancy_threshold,
+        min_keep=prune_min_keep,
+    )
     pred_coords = pred_gaussians.pop("_coords", None)
     if pred_coords is None:
         pred_coords = coords
+    if log_pruning:
+        _log_validation_pruning_counts(
+            batch,
+            coords,
+            pred_coords,
+            occ_list,
+            decoder_prune,
+            log_prefix,
+        )
 
     # ---- L_occ 占位损失计算 ----
     l_occ = torch.tensor(0.0, device=device)
@@ -1069,6 +1152,9 @@ def save_validation_reconstruction(
     device: torch.device,
     ply_path: str,
     image_path: Optional[str] = None,
+    prune: bool = False,
+    occupancy_threshold: float = 0.5,
+    prune_min_keep: int = 1,
 ):
     """Save a validation reconstruction.
 
@@ -1082,7 +1168,13 @@ def save_validation_reconstruction(
     gaussians = {k: v.to(device) for k, v in sample.items()
                  if k in ("offset", "scale", "opacity", "rotation", "color", "sh")}
 
-    pred_gaussians, _, _, _ = raw_model(gaussians, voxel_coords)
+    pred_gaussians, _, _, _ = raw_model(
+        gaussians,
+        voxel_coords,
+        prune=prune,
+        occupancy_threshold=occupancy_threshold,
+        min_keep=prune_min_keep,
+    )
     pred_coords = pred_gaussians.pop("_coords", None)
     if pred_coords is not None:
         pred_voxel_coords = pred_coords[:, 1:] if pred_coords.shape[1] == 4 else pred_coords
@@ -1186,6 +1278,16 @@ def validate(
     raw_model.eval()
     total_loss = total_occ = total_lfq = 0.0
     total_rgb = total_perc = 0.0
+    val_prune_cfg = _validation_pruning_config(cfg)
+    val_prune = bool(val_prune_cfg["prune"])
+    val_occ_threshold = float(val_prune_cfg["occ_threshold"])
+    val_prune_min_keep = int(val_prune_cfg["prune_min_keep"])
+    prediction_mode = "pruned" if val_prune else "unpruned"
+    print(
+        f"[validation pruning] enabled={val_prune} "
+        f"occ_threshold={val_occ_threshold} prune_min_keep={val_prune_min_keep} "
+        f"render_prediction={prediction_mode} saved_reconstruction={prediction_mode}"
+    )
     recon_tag = f"epoch_{epoch:04d}_step_{global_step:08d}"
     recon_path = os.path.join(output_dir, "val_reconstructions", f"{recon_tag}.ply")
     image_path = os.path.join(output_dir, "val_renderings", f"{recon_tag}.png")
@@ -1197,13 +1299,18 @@ def validate(
     val_rng = torch.Generator(device=device)
     val_rng.manual_seed(int(global_step))
     with torch.no_grad():
-        for batch in val_loader:
+        for val_batch_idx, batch in enumerate(val_loader):
             (batch_loss, batch_occ, batch_lfq,
              batch_rgb, batch_perc) = compute_batch_loss(
                 raw_model, batch, cfg, device, backward=False,
                 perceptual=perceptual, rng=val_rng,
                 gt_render_cache=gt_render_cache,
                 global_step=global_step,
+                decoder_prune=val_prune,
+                occupancy_threshold=val_occ_threshold,
+                prune_min_keep=val_prune_min_keep,
+                log_pruning=True,
+                log_prefix=f"validation batch={val_batch_idx}",
             )
             total_loss += batch_loss.item()
             total_occ += batch_occ
@@ -1214,6 +1321,9 @@ def validate(
                 save_validation_reconstruction(
                     raw_model, ase_batch_sample_to_legacy_sample(batch, 0), cfg, device,
                     ply_path=recon_path, image_path=image_path,
+                    prune=val_prune,
+                    occupancy_threshold=val_occ_threshold,
+                    prune_min_keep=val_prune_min_keep,
                 )
                 saved_reconstruction = True
 
@@ -1226,13 +1336,13 @@ def validate(
         f"occ: {total_occ / n_batches:.4f} lfq: {total_lfq / n_batches:.4f}"
     )
     if saved_reconstruction:
-        print(f"Saved validation reconstruction: {recon_path}")
+        print(f"Saved validation reconstruction ({prediction_mode}): {recon_path}")
         if (
             HAS_RASTERIZER
             and device.type == "cuda"
             and _effective_render_view_count(cfg, cfg.get("loss", {})) > 0
         ):
-            print(f"Saved validation renderings:     {image_path}")
+            print(f"Saved validation renderings ({prediction_mode}):     {image_path}")
     return avg_loss
 
 

@@ -57,6 +57,11 @@ loss:
   # 单 chunk 过拟合时建议先关 jitter，让 render target 也固定。
   camera_jitter: 0.0
 
+validation:
+  prune: false
+  occ_threshold: 0.5
+  prune_min_keep: 1
+
 camera_sampling:
   mode: "orbit"             # "orbit" keeps the existing bbox orbit cameras; "scoring" enables GaussianGPT chunk-conditioned sampling.
   dataset_type: "ase"       # "ase": projected chunk bbox area clipped to image / full GT image area.

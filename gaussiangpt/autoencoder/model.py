@@ -100,6 +100,9 @@ class GaussianAutoencoder(nn.Module):
         self,
         gaussians: Dict[str, torch.Tensor],
         voxel_coords: torch.Tensor,
+        prune: bool = False,
+        occupancy_threshold: float = 0.5,
+        min_keep: int = 1,
     ) -> Tuple[Dict[str, torch.Tensor], List, torch.Tensor, torch.Tensor]:
         """
         Full forward pass for training.
@@ -107,6 +110,9 @@ class GaussianAutoencoder(nn.Module):
         Args:
             gaussians: dict of Gaussian attribute tensors, each (N, attr_dim)
             voxel_coords: (N, 3) integer voxel coordinates (relative to chunk)
+            prune: enable decoder occupancy pruning for evaluation/generation-like paths
+            occupancy_threshold: occupancy probability threshold used when pruning
+            min_keep: minimum voxels to keep at each decoder pruning stage
         Returns:
             pred_gaussians: dict of reconstructed Gaussian attributes
             occ_logits_list: list of occupancy logits per decoder upsampling stage
@@ -149,7 +155,12 @@ class GaussianAutoencoder(nn.Module):
                 coordinate_map_key=z_sparse.coordinate_map_key,
                 coordinate_manager=z_sparse.coordinate_manager,
             )
-            decoded_sparse, occ_list = self.decoder(z_q_sparse)
+            decoded_sparse, occ_list = self.decoder(
+                z_q_sparse,
+                prune=prune,
+                occupancy_threshold=occupancy_threshold,
+                min_keep=min_keep,
+            )
             decoded_feat = decoded_sparse.F  # (N_latent, in_ch)
             decoded_coords = decoded_sparse.C.long()
         else:
@@ -158,10 +169,24 @@ class GaussianAutoencoder(nn.Module):
             z_q_grid = torch.zeros(1, num_bits, z_grid.shape[2], z_grid.shape[3], z_grid.shape[4],
                                    device=z_q.device)
             z_q_grid[0, :, latent_vc[:, 0], latent_vc[:, 1], latent_vc[:, 2]] = z_q.T
-            decoded_grid, occ_list = self.decoder(z_q_grid)  # (1, in_ch, gx, gy, gz)
+            decoded_grid, occ_list = self.decoder(
+                z_q_grid,
+                prune=prune,
+                occupancy_threshold=occupancy_threshold,
+                min_keep=min_keep,
+            )  # (1, in_ch, gx, gy, gz)
             decoded_feat = decoded_grid[0, :, vc[:, 0], vc[:, 1], vc[:, 2]].T  # (N, in_ch)
             batch_idx = torch.zeros(vc.shape[0], 1, dtype=torch.long, device=vc.device)
             decoded_coords = torch.cat([batch_idx, vc.long()], dim=1)
+            if prune and occ_list:
+                final_keep = self.decoder._dense_keep_mask(
+                    occ_list[-1],
+                    occupancy_threshold,
+                    min_keep,
+                )
+                keep_at_input_coords = final_keep[0, 0, vc[:, 0], vc[:, 1], vc[:, 2]]
+                decoded_feat = decoded_feat[keep_at_input_coords]
+                decoded_coords = decoded_coords[keep_at_input_coords]
 
         # Step 5: decode features back to Gaussian attributes
         pred_gaussians = self.attr_decoder(decoded_feat)

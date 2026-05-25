@@ -46,6 +46,11 @@ loss:
   upper_hemisphere_only: false
   camera_jitter: 0.05       # small unit-vector perturbation on each spherical sample
 
+validation:
+  prune: false              # false keeps validation on unpruned AE reconstructions.
+  occ_threshold: 0.5         # Same probability threshold semantics as generate.py --occ_threshold.
+  prune_min_keep: 1          # Same per-stage minimum as generate.py --prune_min_keep.
+
 camera_sampling:
   mode: "orbit"             # "orbit" keeps the existing bbox orbit cameras; "scoring" enables GaussianGPT chunk-conditioned sampling.
   dataset_type: "ase"       # "ase": projected chunk bbox area clipped to image / full GT image area.

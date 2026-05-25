@@ -304,6 +304,12 @@ def generate_outpainting(ae, gpt, args, device):
 def main():
     args = parse_args()
     ae, gpt, device = load_models(args)
+    print(
+        "[generation pruning] "
+        f"enabled={not args.disable_occupancy_pruning} "
+        f"occ_threshold={args.occ_threshold} "
+        f"prune_min_keep={args.prune_min_keep}"
+    )
 
     if args.mode == "unconditional":
         results = generate_unconditional(ae, gpt, args, device)

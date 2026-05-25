@@ -29,6 +29,11 @@ loss:
   upper_hemisphere_only: true
   camera_jitter: 0.05
 
+validation:
+  prune: false
+  occ_threshold: 0.5
+  prune_min_keep: 1
+
 training:
   epochs: 100
   batch_size: 24

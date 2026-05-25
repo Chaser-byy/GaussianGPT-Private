@@ -3,6 +3,7 @@ torchvision>=0.15.0
 numpy>=1.24.0
 scipy>=1.10.0
 pyyaml>=6.0
+plyfile>=1.0
 tqdm>=4.65.0
 einops>=0.6.0
 # MinkowskiEngine for sparse 3D convolutions (required for full functionality)
