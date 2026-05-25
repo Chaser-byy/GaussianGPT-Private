@@ -34,6 +34,44 @@ DEFAULT_INVALID_DEPTH_MAX = 1.0e4
 EXR_FLOAT16_MAX = 65504.0
 
 
+try:
+    _BOOLEAN_OPTIONAL_ACTION = argparse.BooleanOptionalAction
+except AttributeError:
+    class _BooleanOptionalAction(argparse.Action):
+        """argparse.BooleanOptionalAction fallback for Python < 3.9."""
+
+        def __init__(
+            self,
+            option_strings: Sequence[str],
+            dest: str,
+            default: Optional[bool] = None,
+            **kwargs: Any,
+        ) -> None:
+            options = []
+            for option in option_strings:
+                options.append(option)
+                if option.startswith("--"):
+                    options.append("--no-" + option[2:])
+            super().__init__(
+                option_strings=options,
+                dest=dest,
+                nargs=0,
+                default=default,
+                **kwargs,
+            )
+
+        def __call__(
+            self,
+            parser: argparse.ArgumentParser,
+            namespace: argparse.Namespace,
+            values: Any,
+            option_string: Optional[str] = None,
+        ) -> None:
+            setattr(namespace, self.dest, not str(option_string).startswith("--no-"))
+
+    _BOOLEAN_OPTIONAL_ACTION = _BooleanOptionalAction
+
+
 @dataclass
 class Camera:
     fx: float
@@ -2284,7 +2322,7 @@ def parse_args() -> argparse.Namespace:
     build.add_argument("--max-points", type=int, default=300000)
     build.add_argument("--voxel-size", type=float, default=0.02)
     build.add_argument("--seed", type=int, default=1234)
-    build.add_argument("--copy-images", action=argparse.BooleanOptionalAction, default=True)
+    build.add_argument("--copy-images", action=_BOOLEAN_OPTIONAL_ACTION, default=True)
     add_common_camera_args(build)
     build.set_defaults(func=build_room)
 
@@ -2295,7 +2333,7 @@ def parse_args() -> argparse.Namespace:
     scaffold.add_argument("--room-id", default=None, help="Room id or room_path from manifest. Defaults to first room.")
     scaffold.add_argument("--room-package-dir", type=Path, default=None, help="Explicit built room package directory.")
     scaffold.add_argument("--scaffold-repo", type=Path, default=None, help="Optional Scaffold-GS/3DGS repo path recorded in summary.")
-    scaffold.add_argument("--symlink-images", action=argparse.BooleanOptionalAction, default=False)
+    scaffold.add_argument("--symlink-images", action=_BOOLEAN_OPTIONAL_ACTION, default=False)
     scaffold.add_argument("--max-colmap-points", type=int, default=None, help="Optional cap for sparse/0/points3D.txt; points3D.ply is copied in full.")
     scaffold.set_defaults(func=prepare_scaffold_room)
 
@@ -2307,7 +2345,7 @@ def parse_args() -> argparse.Namespace:
     train_scaffold.add_argument("--python", default=sys.executable)
     train_scaffold.add_argument("--extra-args", default="", help="Extra args passed to train.py, shell-quoted string.")
     train_scaffold.add_argument("--dry-run", action="store_true")
-    train_scaffold.add_argument("--render-preview", action=argparse.BooleanOptionalAction, default=True)
+    train_scaffold.add_argument("--render-preview", action=_BOOLEAN_OPTIONAL_ACTION, default=True)
     train_scaffold.add_argument("--render-extra-args", default="", help="Extra args passed to render.py if present.")
     train_scaffold.add_argument("--gaussiangpt-mode", action="store_true", help="Enable the constrained Scaffold-GS GaussianGPT preparation mode.")
     train_scaffold.add_argument("--anchor-voxel-size", type=float, default=0.025, help="Voxel size used to align Scaffold-GS anchors.")
