@@ -42,7 +42,7 @@ def _zero_camera_score(frame: Dict) -> Dict:
         "depth_min": None,
         "depth_max": None,
         "near_plane_crossing": False,
-        "selection_mode": None,
+        "selection_mode": "score_only",
     }
 
 
@@ -75,7 +75,7 @@ def score_cameras_for_chunk(
     cameras: ASECameras,
     chunk_world_min: np.ndarray,
     chunk_world_max: np.ndarray,
-    top_k: int = 12,
+    top_k: int = 0,
     include_camera_matrices: bool = False,
 ) -> List[Dict]:
     """Score cameras by projected chunk bbox overlap with the image plane.
@@ -83,8 +83,12 @@ def score_cameras_for_chunk(
     For ASE, GaussianGPT uses a projected-bbox heuristic rather than depth-map
     visible-area scoring. Here chunk_coverage is the clipped projected chunk
     bbox area divided by the whole image area. bbox_inside_ratio is retained as
-    a diagnostic for the old intersection/projected-bbox-area ratio.
+    a diagnostic for the old intersection/projected-bbox-area ratio. Cameras
+    are scored independently; zero-score views remain in the returned list.
+    `top_k` is accepted for backward compatibility and ignored.
     """
+
+    del top_k
 
     corners = _bbox_corners(chunk_world_min, chunk_world_max)
     corners_h = np.concatenate([corners, np.ones((8, 1), dtype=np.float32)], axis=1)
@@ -187,7 +191,7 @@ def score_cameras_for_chunk(
                 "depth_min": depth_min,
                 "depth_max": depth_max,
                 "near_plane_crossing": near_plane_crossing,
-                "selection_mode": None,
+                "selection_mode": "score_only",
             }
             if include_camera_matrices:
                 score = _attach_camera_pose(score, frame, cameras)
@@ -207,7 +211,7 @@ def score_cameras_for_chunk(
         ),
         reverse=True,
     )
-    return sorted_scores[:top_k] if top_k and top_k > 0 else sorted_scores
+    return sorted_scores
 
 
 def select_cameras_for_chunk(
@@ -218,36 +222,23 @@ def select_cameras_for_chunk(
     preferred_coverage: float = 0.4,
     include_camera_matrices: bool = False,
 ) -> List[Dict]:
-    """Select ASE cameras via GaussianGPT's projected-bbox heuristic."""
+    """Return score-only ASE camera candidates for a chunk.
 
-    top_k_value = int(top_k) if top_k is not None else 0
-    scores = score_cameras_for_chunk(
+    The old preferred/fallback/no-overlap selection heuristic is intentionally
+    bypassed. Downstream training samples from all pose-bearing cameras using
+    normalized chunk_coverage scores, so this function only computes and
+    returns those scores. `top_k` and `preferred_coverage` are accepted for
+    backward-compatible call sites but do not affect the result.
+    """
+
+    del top_k, preferred_coverage
+    return score_cameras_for_chunk(
         cameras,
         chunk_world_min,
         chunk_world_max,
         top_k=0,
         include_camera_matrices=include_camera_matrices,
     )
-    preferred = [
-        dict(score, selection_mode="preferred")
-        for score in scores
-        if score["valid_projection"] and score["chunk_coverage"] >= preferred_coverage
-    ]
-    if preferred:
-        return preferred[:top_k_value] if top_k_value > 0 else preferred
-
-    fallback_overlap = [
-        dict(score, selection_mode="fallback_overlap")
-        for score in scores
-        if score["valid_projection"]
-        and score["intersection_area"] > 0.0
-        and score["frame_index"] not in {item["frame_index"] for item in preferred}
-    ]
-    if fallback_overlap:
-        return fallback_overlap[:top_k_value] if top_k_value > 0 else fallback_overlap
-
-    fallback = [dict(score, selection_mode="no_overlap_topk") for score in scores]
-    return fallback[:top_k_value] if top_k_value > 0 else fallback
 
 
 def build_chunk_from_scene_cache(
@@ -502,7 +493,7 @@ class ASEOnlineChunkSampler:
                 "uses_transform_device_camera": cameras.uses_transform_device_camera,
                 "scoring_dataset_type": "ase",
                 "score_key": "chunk_coverage",
-                "preferred_coverage": self.preferred_coverage,
+                "selection_mode": "score_only",
                 "top_cameras": top_cameras,
             },
             "z_mode": self.z_mode,

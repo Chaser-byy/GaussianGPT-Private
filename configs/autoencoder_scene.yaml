@@ -22,7 +22,7 @@ data:
   max_candidate_chunks: 10
   top_k_cameras: 12
   z_mode: "fixed_160"
-  preferred_coverage: 0.4
+  preferred_coverage: 0.4          # Deprecated/ignored by ASE camera scoring.
   num_workers: 4
   val_num_workers: 2
   pin_memory: false
@@ -56,10 +56,10 @@ camera_sampling:
   dataset_type: "ase"       # "ase": projected chunk bbox area clipped to image / full GT image area.
                              # "3dfront": depth-map visible-area scoring; not implemented in this ASE path.
   num_views: null           # scoring only; null falls back to loss.n_images
-  num_candidates: null      # ASE null = score/sample from all scene cameras; 3D-FRONT null would use 8 * num_views.
+  num_candidates: null      # Ignored for ASE scoring, which always uses all scene cameras; 3D-FRONT null would use 8 * num_views.
   temperature: 1.0          # scoring only; p(camera) is proportional to score ** (1 / temperature)
   score_key: "chunk_coverage"  # ASE default. bbox_inside_ratio is only projected-bbox-in-image diagnostic.
-  preferred_coverage: 0.4   # ASE Appendix C heuristic: prefer cameras with >=40% projected chunk coverage.
+  preferred_coverage: 0.4   # Deprecated/ignored for ASE score-only sampling; kept for config compatibility.
   seed: null
   log_every: 100
 
