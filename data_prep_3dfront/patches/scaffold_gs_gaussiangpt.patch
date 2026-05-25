@@ -1,0 +1,371 @@
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index 5621002..19c8043 100755
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -50,6 +50,10 @@ class ModelParams(ParamGroup):
+         self.feat_dim = 32
+         self.n_offsets = 10
+         self.voxel_size =  0.001 # if voxel_size<=0, using 1nn dist
++        self.gaussiangpt_mode = False
++        self.anchor_voxel_size = 0.025
++        self.align_anchor_to_voxel_center = False
++        self.one_gaussian_per_anchor = False
+         self.update_depth = 3
+         self.update_init_factor = 16
+         self.update_hierachy_factor = 4
+@@ -151,6 +155,7 @@ class OptimizationParams(ParamGroup):
+         self.min_opacity = 0.005
+         self.success_threshold = 0.8
+         self.densify_grad_threshold = 0.0002
++        self.nan_debug_interval = 0
+ 
+         super().__init__(parser, "Optimization Parameters")
+ 
+diff --git a/gaussian_renderer/__init__.py b/gaussian_renderer/__init__.py
+index 3982888..720503e 100755
+--- a/gaussian_renderer/__init__.py
++++ b/gaussian_renderer/__init__.py
+@@ -28,7 +28,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
+     ## get view properties for anchor
+     ob_view = anchor - viewpoint_camera.camera_center
+     # dist
+-    ob_dist = ob_view.norm(dim=1, keepdim=True)
++    ob_dist = ob_view.norm(dim=1, keepdim=True).clamp_min(1e-8)
+     # view
+     ob_view = ob_view / ob_dist
+ 
+@@ -173,7 +173,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
+                 "radii": radii,
+                 "selection_mask": mask,
+                 "neural_opacity": neural_opacity,
++                "xyz": xyz,
++                "color": color,
+                 "scaling": scaling,
++                "rotation": rot,
+                 }
+     else:
+         return {"render": rendered_image,
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index 1d57a5a..5125810 100755
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -57,11 +57,19 @@ class GaussianModel:
+                  add_opacity_dist : bool = False,
+                  add_cov_dist : bool = False,
+                  add_color_dist : bool = False,
++                 gaussiangpt_mode : bool = False,
++                 anchor_voxel_size : float = 0.025,
++                 align_anchor_to_voxel_center : bool = False,
++                 one_gaussian_per_anchor : bool = False,
+                  ):
+ 
+         self.feat_dim = feat_dim
+-        self.n_offsets = n_offsets
+-        self.voxel_size = voxel_size
++        self.gaussiangpt_mode = gaussiangpt_mode
++        self.anchor_voxel_size = anchor_voxel_size
++        self.align_anchor_to_voxel_center = align_anchor_to_voxel_center
++        self.one_gaussian_per_anchor = one_gaussian_per_anchor
++        self.n_offsets = 1 if (gaussiangpt_mode and one_gaussian_per_anchor) else n_offsets
++        self.voxel_size = anchor_voxel_size if (gaussiangpt_mode and anchor_voxel_size > 0) else voxel_size
+         self.update_depth = update_depth
+         self.update_init_factor = update_init_factor
+         self.update_hierachy_factor = update_hierachy_factor
+@@ -107,7 +115,7 @@ class GaussianModel:
+         self.mlp_opacity = nn.Sequential(
+             nn.Linear(feat_dim+3+self.opacity_dist_dim, feat_dim),
+             nn.ReLU(True),
+-            nn.Linear(feat_dim, n_offsets),
++            nn.Linear(feat_dim, self.n_offsets),
+             nn.Tanh()
+         ).cuda()
+ 
+@@ -126,6 +134,20 @@ class GaussianModel:
+             nn.Linear(feat_dim, 3*self.n_offsets),
+             nn.Sigmoid()
+         ).cuda()
++        if self.gaussiangpt_mode:
++            with torch.no_grad():
++                last = self.mlp_opacity[-2]
++                last.weight.zero_()
++                last.bias.fill_(0.1)
++
++    def enforce_anchor_voxel_alignment(self):
++        if not (self.gaussiangpt_mode and self.align_anchor_to_voxel_center):
++            return
++        voxel_size = float(self.anchor_voxel_size if self.anchor_voxel_size > 0 else self.voxel_size)
++        if voxel_size <= 0 or self._anchor.numel() == 0:
++            return
++        with torch.no_grad():
++            self._anchor.data = torch.round(self._anchor.data / voxel_size) * voxel_size
+ 
+ 
+     def eval(self):
+@@ -250,6 +272,9 @@ class GaussianModel:
+         
+         points = self.voxelize_sample(points, voxel_size=self.voxel_size)
+         fused_point_cloud = torch.tensor(np.asarray(points)).float().cuda()
++        if self.gaussiangpt_mode and self.align_anchor_to_voxel_center:
++            voxel_size = float(self.anchor_voxel_size if self.anchor_voxel_size > 0 else self.voxel_size)
++            fused_point_cloud = torch.round(fused_point_cloud / voxel_size) * voxel_size
+         offsets = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3)).float().cuda()
+         anchors_feat = torch.zeros((fused_point_cloud.shape[0], self.feat_dim)).float().cuda()
+         
+@@ -270,6 +295,7 @@ class GaussianModel:
+         self._rotation = nn.Parameter(rots.requires_grad_(False))
+         self._opacity = nn.Parameter(opacities.requires_grad_(False))
+         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
++        self.enforce_anchor_voxel_alignment()
+ 
+ 
+     def training_setup(self, training_args):
+diff --git a/train.py b/train.py
+index 166cc4c..a48d6f8 100755
+--- a/train.py
++++ b/train.py
+@@ -79,12 +79,141 @@ def saveRuntimeCode(dst: str) -> None:
+     print('Backup Finished!')
+ 
+ 
++def _tensor_debug_stats(value):
++    if value is None:
++        return None
++    if isinstance(value, torch.Tensor):
++        data = value.detach()
++    else:
++        try:
++            data = torch.as_tensor(value)
++        except Exception:
++            return {"type": type(value).__name__}
++    stats = {
++        "shape": list(data.shape),
++        "numel": int(data.numel()),
++        "dtype": str(data.dtype),
++        "device": str(data.device),
++    }
++    if data.numel() == 0:
++        stats.update({"finite_count": 0, "nan_count": 0, "inf_count": 0, "min": None, "max": None, "mean": None})
++        return stats
++    if data.is_floating_point() or data.is_complex():
++        finite = torch.isfinite(data)
++        stats["finite_count"] = int(finite.sum().item())
++        stats["nan_count"] = int(torch.isnan(data).sum().item())
++        stats["inf_count"] = int(torch.isinf(data).sum().item())
++        if finite.any():
++            vals = data[finite].float()
++            stats["min"] = float(vals.min().item())
++            stats["max"] = float(vals.max().item())
++            stats["mean"] = float(vals.mean().item())
++        else:
++            stats.update({"min": None, "max": None, "mean": None})
++    else:
++        stats["min"] = int(data.min().item()) if data.numel() else None
++        stats["max"] = int(data.max().item()) if data.numel() else None
++    return stats
++
++
++def _is_bad_tensor(value):
++    if not isinstance(value, torch.Tensor):
++        return False
++    if value.numel() == 0:
++        return False
++    return bool((~torch.isfinite(value)).any().item()) if value.is_floating_point() else False
++
++
++def _loss_item(value):
++    if isinstance(value, torch.Tensor):
++        return float(value.detach().item())
++    return float(value)
++
++
++def _write_nan_debug(model_path, payload):
++    path = os.path.join(model_path, "nan_debug.json")
++    with open(path, "w") as f:
++        json.dump(payload, f, indent=2, sort_keys=True)
++    return path
++
++
++def _apply_stable_debug_preset(args):
++    preset = {
++        "offset_lr_init": 0.001,
++        "offset_lr_final": 0.00001,
++        "feature_lr": 0.00075,
++        "opacity_lr": 0.002,
++        "scaling_lr": 0.0007,
++        "rotation_lr": 0.0002,
++        "mlp_opacity_lr_init": 0.0002,
++        "mlp_opacity_lr_final": 0.000002,
++        "mlp_cov_lr_init": 0.0004,
++        "mlp_cov_lr_final": 0.0004,
++        "mlp_color_lr_init": 0.0008,
++        "mlp_color_lr_final": 0.000005,
++        "appearance_lr_init": 0.005,
++        "appearance_lr_final": 0.00005,
++    }
++    for key, value in preset.items():
++        setattr(args, key, value)
++    args.debug_from = 0
++    if not getattr(args, "nan_debug_interval", 0):
++        args.nan_debug_interval = 10
++    return preset
++
++
++def _nan_debug_payload(iteration, viewpoint_cam, render_pkg, losses, reason):
++    tensors = {
++        "render": render_pkg.get("render"),
++        "visibility_filter": render_pkg.get("visibility_filter"),
++        "selection_mask": render_pkg.get("selection_mask"),
++        "neural_opacity": render_pkg.get("neural_opacity"),
++        "scaling": render_pkg.get("scaling"),
++        "rotation": render_pkg.get("rotation"),
++        "color": render_pkg.get("color"),
++        "xyz": render_pkg.get("xyz"),
++        "radii": render_pkg.get("radii"),
++    }
++    payload = {
++        "iteration": int(iteration),
++        "reason": reason,
++        "camera": {
++            "uid": int(getattr(viewpoint_cam, "uid", -1)),
++            "image_name": str(getattr(viewpoint_cam, "image_name", "")),
++        },
++        "losses": {name: _loss_item(value) for name, value in losses.items()},
++        "tensors": {name: _tensor_debug_stats(value) for name, value in tensors.items()},
++    }
++    selection_mask = render_pkg.get("selection_mask")
++    visibility_filter = render_pkg.get("visibility_filter")
++    if isinstance(selection_mask, torch.Tensor):
++        payload["selection_mask_true_count"] = int(selection_mask.sum().item())
++    if isinstance(visibility_filter, torch.Tensor):
++        payload["visibility_true_count"] = int(visibility_filter.sum().item())
++    return payload
++
++
+ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
+     first_iter = 0
+     tb_writer = prepare_output_and_logger(dataset)
++    if getattr(dataset, "gaussiangpt_mode", False):
++        if getattr(dataset, "one_gaussian_per_anchor", False):
++            dataset.n_offsets = 1
++        if getattr(dataset, "anchor_voxel_size", 0.0) > 0:
++            dataset.voxel_size = dataset.anchor_voxel_size
++        opt.update_until = 0
++        if logger is not None:
++            logger.info(
++                "GaussianGPT mode active: n_offsets=%s voxel_size=%s align_anchor_to_voxel_center=%s; anchor densification disabled",
++                dataset.n_offsets,
++                dataset.voxel_size,
++                getattr(dataset, "align_anchor_to_voxel_center", False),
++            )
+     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
+-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
++                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
++                              dataset.gaussiangpt_mode, dataset.anchor_voxel_size, dataset.align_anchor_to_voxel_center, dataset.one_gaussian_per_anchor)
+     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
++    gaussians.enforce_anchor_voxel_alignment()
+     gaussians.training_setup(opt)
+     if checkpoint:
+         (model_params, first_iter) = torch.load(checkpoint)
+@@ -141,9 +270,51 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
+         Ll1 = l1_loss(image, gt_image)
+ 
+         ssim_loss = (1.0 - ssim(image, gt_image))
+-        scaling_reg = scaling.prod(dim=1).mean()
++        if scaling.numel() == 0:
++            scaling_reg = torch.zeros((), dtype=image.dtype, device=image.device)
++        else:
++            scaling_reg = scaling.prod(dim=1).mean()
+         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+ 
++        loss_parts = {
++            "l1": Ll1,
++            "ssim": ssim_loss,
++            "scaling_reg": scaling_reg,
++            "loss": loss,
++        }
++        bad_reasons = []
++        for name, value in loss_parts.items():
++            if _is_bad_tensor(value):
++                bad_reasons.append(f"{name}_nonfinite")
++        for name in ("render", "neural_opacity", "scaling", "rotation", "color", "xyz"):
++            if _is_bad_tensor(render_pkg.get(name)):
++                bad_reasons.append(f"{name}_nonfinite")
++        if isinstance(visibility_filter, torch.Tensor) and visibility_filter.numel() > 0 and not bool(visibility_filter.any().item()):
++            bad_reasons.append("visibility_filter_all_false")
++        if isinstance(offset_selection_mask, torch.Tensor) and offset_selection_mask.numel() > 0 and not bool(offset_selection_mask.any().item()):
++            bad_reasons.append("selection_mask_all_false")
++        if bad_reasons:
++            payload = _nan_debug_payload(iteration, viewpoint_cam, render_pkg, loss_parts, ",".join(bad_reasons))
++            path = _write_nan_debug(scene.model_path, payload)
++            if logger is not None:
++                logger.error("Stopping at iteration %s due to %s; wrote %s", iteration, ",".join(bad_reasons), path)
++            progress_bar.close()
++            raise RuntimeError(f"NaN/empty render debug stop at iteration {iteration}: {','.join(bad_reasons)}")
++
++        if logger is not None and getattr(opt, "nan_debug_interval", 0) and iteration % int(opt.nan_debug_interval) == 0:
++            logger.info(
++                "[ITER %s] loss=%g l1=%g ssim=%g scaling_reg=%g visible=%s selected=%s render_min=%s render_max=%s",
++                iteration,
++                _loss_item(loss),
++                _loss_item(Ll1),
++                _loss_item(ssim_loss),
++                _loss_item(scaling_reg),
++                int(visibility_filter.sum().item()) if isinstance(visibility_filter, torch.Tensor) else -1,
++                int(offset_selection_mask.sum().item()) if isinstance(offset_selection_mask, torch.Tensor) else -1,
++                _tensor_debug_stats(image).get("min"),
++                _tensor_debug_stats(image).get("max"),
++            )
++
+         loss.backward()
+         
+         iter_end.record()
+@@ -181,6 +352,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
+             # Optimizer step
+             if iteration < opt.iterations:
+                 gaussians.optimizer.step()
++                gaussians.enforce_anchor_voxel_alignment()
+                 gaussians.optimizer.zero_grad(set_to_none = True)
+             if (iteration in checkpoint_iterations):
+                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
+@@ -324,7 +496,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
+ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
+     with torch.no_grad():
+         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
+-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
++                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
++                              dataset.gaussiangpt_mode, dataset.anchor_voxel_size, dataset.align_anchor_to_voxel_center, dataset.one_gaussian_per_anchor)
+         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+         gaussians.eval()
+ 
+@@ -472,7 +645,22 @@ if __name__ == "__main__":
+     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+     parser.add_argument("--start_checkpoint", type=str, default = None)
+     parser.add_argument("--gpu", type=str, default = '-1')
++    parser.add_argument("--gaussiangpt-mode", dest="gaussiangpt_mode", action="store_true")
++    parser.add_argument("--anchor-voxel-size", dest="anchor_voxel_size", type=float)
++    parser.add_argument("--align-anchor-to-voxel-center", dest="align_anchor_to_voxel_center", action="store_true")
++    parser.add_argument("--one-gaussian-per-anchor", dest="one_gaussian_per_anchor", action="store_true")
++    parser.add_argument("--stable-debug", "--stable_debug", dest="stable_debug", action="store_true")
++    parser.add_argument("--nan-debug-interval", dest="nan_debug_interval", type=int, default=0)
+     args = parser.parse_args(sys.argv[1:])
++    stable_debug_preset = _apply_stable_debug_preset(args) if args.stable_debug else None
++    if args.anchor_voxel_size is None:
++        args.anchor_voxel_size = 0.025
++    if args.gaussiangpt_mode:
++        if args.one_gaussian_per_anchor:
++            args.n_offsets = 1
++        if args.anchor_voxel_size is not None and args.anchor_voxel_size > 0:
++            args.voxel_size = args.anchor_voxel_size
++        args.update_until = 0
+     args.save_iterations.append(args.iterations)
+ 
+     
+@@ -485,6 +673,8 @@ if __name__ == "__main__":
+ 
+ 
+     logger.info(f'args: {args}')
++    if stable_debug_preset is not None:
++        logger.info(f'stable_debug_preset: {stable_debug_preset}')
+ 
+     if args.gpu != '-1':
+         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)

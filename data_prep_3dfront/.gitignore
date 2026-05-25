@@ -3,3 +3,5 @@
 !/README.md
 !/download_3dfront_render.py
 !/prepare_3dfront_render.py
+!/patches/
+!/patches/*.patch
