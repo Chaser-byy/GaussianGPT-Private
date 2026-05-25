@@ -94,6 +94,25 @@ def patch_renderer(repo: Path) -> list[str]:
             raise RuntimeError(f"{path}: could not find render debug return block")
         write(path, text.replace(old, new, 1))
         changed.append("renderer: return debug tensors")
+    text = read(path)
+    if "antialiasing=False" not in text:
+        old = (
+            "        campos=viewpoint_camera.camera_center,\n"
+            "        prefiltered=False,\n"
+            "        debug=pipe.debug\n"
+        )
+        new = (
+            "        campos=viewpoint_camera.camera_center,\n"
+            "        prefiltered=False,\n"
+            "        antialiasing=False,\n"
+            "        debug=pipe.debug\n"
+        )
+        count = text.count(old)
+        if count == 0:
+            raise RuntimeError(f"{path}: could not find raster settings blocks")
+        text = text.replace(old, new)
+        write(path, text)
+        changed.append(f"renderer: antialiasing flag ({count} blocks)")
     return changed
 
 
