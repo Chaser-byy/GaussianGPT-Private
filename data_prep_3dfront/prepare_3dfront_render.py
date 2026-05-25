@@ -2141,7 +2141,7 @@ def train_scaffold_room(args: argparse.Namespace) -> None:
         representation_summary["anchor_aligned_to_voxel_centers"] = bool(output_alignment["aligned"])
         representation_summary["anchor_alignment"] = output_alignment
         representation_summary["one_gaussian_per_anchor"] = bool(representation_summary.get("offsets_per_anchor") == 1)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         representation_summary = {"error": str(exc)}
     train_summary.update(
         {
@@ -2193,9 +2193,11 @@ def train_scaffold_room(args: argparse.Namespace) -> None:
     print(f"[train-scaffold] returncode={proc.returncode} elapsed={elapsed:.1f}s")
     print(f"[train-scaffold] summary={output_dir / 'train_summary.json'}")
     if proc.returncode != 0:
+        detail = f"see {output_dir / 'train_stdout_stderr.log'}"
+        if nan_debug_path.is_file():
+            detail += f" and {nan_debug_path}"
         raise SystemExit(
-            f"Scaffold/3DGS training failed with returncode={proc.returncode}; "
-            f"see {output_dir / 'train_stdout_stderr.log'}"
+            f"Scaffold/3DGS training failed with returncode={proc.returncode}; {detail}"
         )
 
 
