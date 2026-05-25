@@ -5,3 +5,4 @@
 !/prepare_3dfront_render.py
 !/patches/
 !/patches/*.patch
+!/patches/*.py
