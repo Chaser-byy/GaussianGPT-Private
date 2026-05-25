@@ -1346,7 +1346,15 @@ def _find_training_outputs(output_dir: Path) -> Dict[str, Any]:
     }
 
 
-def _append_stable_debug_args(cmd: List[str]) -> Dict[str, float]:
+def _train_script_supports_name(train_script: Path, name: str) -> bool:
+    try:
+        text = train_script.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return name in text
+
+
+def _append_stable_debug_args(cmd: List[str], train_script: Path) -> Tuple[Dict[str, float], List[str]]:
     preset = {
         "offset_lr_init": 0.001,
         "offset_lr_final": 0.00001,
@@ -1365,8 +1373,13 @@ def _append_stable_debug_args(cmd: List[str]) -> Dict[str, float]:
     }
     for key, value in preset.items():
         cmd.extend([f"--{key}", str(value)])
-    cmd.extend(["--debug_from", "0", "--nan_debug_interval", "10"])
-    return preset
+    cmd.extend(["--debug_from", "0"])
+    skipped = []
+    if _train_script_supports_name(train_script, "nan_debug_interval"):
+        cmd.extend(["--nan_debug_interval", "10"])
+    else:
+        skipped.append("--nan_debug_interval")
+    return preset, skipped
 
 
 def _read_ply_vertex(path: Path) -> Tuple[np.ndarray, List[str], str]:
@@ -2066,13 +2079,21 @@ def train_scaffold_room(args: argparse.Namespace) -> None:
         cmd.append("--align_anchor_to_voxel_center")
     if args.anchor_voxel_size is not None:
         cmd.extend(["--anchor_voxel_size", str(float(args.anchor_voxel_size))])
-    stable_debug_preset = _append_stable_debug_args(cmd) if args.stable_debug else None
+    skipped_train_args = []
+    if args.stable_debug:
+        stable_debug_preset, stable_debug_skipped = _append_stable_debug_args(cmd, train_script)
+        skipped_train_args.extend(stable_debug_skipped)
+    else:
+        stable_debug_preset = None
     if args.detect_anomaly:
         cmd.append("--detect_anomaly")
     if args.debug:
         cmd.append("--debug")
     if args.nan_debug_interval is not None:
-        cmd.extend(["--nan_debug_interval", str(int(args.nan_debug_interval))])
+        if _train_script_supports_name(train_script, "nan_debug_interval"):
+            cmd.extend(["--nan_debug_interval", str(int(args.nan_debug_interval))])
+        else:
+            skipped_train_args.append("--nan_debug_interval")
     cmd.extend(_split_extra_args(args.extra_args))
     gaussiangpt_mode_effective = bool(args.gaussiangpt_mode)
     anchor_voxel_size_effective = float(args.anchor_voxel_size) if args.anchor_voxel_size is not None else None
@@ -2107,6 +2128,7 @@ def train_scaffold_room(args: argparse.Namespace) -> None:
         "detect_anomaly": bool(args.detect_anomaly),
         "debug": bool(args.debug),
         "nan_debug_interval": int(args.nan_debug_interval) if args.nan_debug_interval is not None else (10 if args.stable_debug else None),
+        "skipped_train_args": skipped_train_args,
         "paper_faithful_training_note": (
             "GaussianGPT mode requests Scaffold-GS anchors aligned to voxel centers and n_offsets=1. "
             "Final explicit Gaussian attributes still require export-gt-gaussian because Scaffold-GS stores "
