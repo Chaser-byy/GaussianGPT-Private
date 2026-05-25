@@ -214,7 +214,7 @@ def select_cameras_for_chunk(
     preferred_coverage: float = 0.4,
     include_camera_matrices: bool = False,
 ) -> List[Dict]:
-    """Select cameras for a chunk and annotate why each camera was selected."""
+    """Select ASE cameras via GaussianGPT's projected-bbox heuristic."""
 
     scores = score_cameras_for_chunk(
         cameras,
@@ -495,6 +495,9 @@ class ASEOnlineChunkSampler:
                 "camera_cache_path": str(self._camera_cache_path(metadata)),
                 "pose_convention": cameras.pose_convention,
                 "uses_transform_device_camera": cameras.uses_transform_device_camera,
+                "scoring_dataset_type": "ase",
+                "score_key": "chunk_coverage",
+                "preferred_coverage": self.preferred_coverage,
                 "top_cameras": top_cameras,
             },
             "z_mode": self.z_mode,

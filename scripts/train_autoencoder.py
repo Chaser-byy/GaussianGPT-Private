@@ -101,6 +101,49 @@ def _camera_sampling_config(cfg: dict) -> tuple:
     return camera_cfg, mode
 
 
+def _camera_dataset_type(cfg: dict) -> str:
+    camera_cfg, _mode = _camera_sampling_config(cfg)
+    dataset_type = str(camera_cfg.get("dataset_type", "ase")).lower()
+    aliases = {
+        "ase": "ase",
+        "3dfront": "3dfront",
+        "3d-front": "3dfront",
+        "3d_front": "3dfront",
+        "front": "3dfront",
+    }
+    if dataset_type not in aliases:
+        raise ValueError(
+            "camera_sampling.dataset_type must be 'ase' or '3dfront', "
+            f"got {dataset_type!r}"
+        )
+    return aliases[dataset_type]
+
+
+def _validate_camera_sampling_config(cfg: dict) -> None:
+    camera_cfg, mode = _camera_sampling_config(cfg)
+    if mode != "scoring":
+        return
+
+    dataset_type = _camera_dataset_type(cfg)
+    if dataset_type == "ase":
+        score_key = str(camera_cfg.get("score_key", "chunk_coverage"))
+        if score_key != "chunk_coverage":
+            raise ValueError(
+                "GaussianGPT ASE camera scoring uses projected chunk bbox "
+                "coverage. Set camera_sampling.score_key='chunk_coverage'; "
+                f"got {score_key!r}."
+            )
+        return
+
+    raise NotImplementedError(
+        "camera_sampling.dataset_type='3dfront' requires the GaussianGPT "
+        "3D-FRONT path with pre-rendered images and depth maps to compute "
+        "visible chunk area. This repository path currently trains from ASE "
+        "camera caches only, so 3D-FRONT depth-map scoring is intentionally "
+        "not emulated."
+    )
+
+
 def _effective_render_view_count(cfg: dict, loss_cfg: Optional[dict] = None) -> int:
     loss_cfg = cfg.get("loss", {}) if loss_cfg is None else loss_cfg
     n_views = int(loss_cfg.get("n_images", 0))
@@ -120,6 +163,12 @@ def _camera_candidate_count(cfg: dict, n_views: int) -> int:
 def _camera_score_key(cfg: dict) -> str:
     camera_cfg, _mode = _camera_sampling_config(cfg)
     return str(camera_cfg.get("score_key", "chunk_coverage"))
+
+
+def _ase_preferred_coverage(cfg: dict) -> float:
+    camera_cfg, _mode = _camera_sampling_config(cfg)
+    data_cfg = cfg.get("data", {}) or {}
+    return float(camera_cfg.get("preferred_coverage", data_cfg.get("preferred_coverage", 0.4)))
 
 
 def _camera_candidates_from_sample(sample: dict) -> list:
@@ -146,6 +195,22 @@ def _camera_candidate_signature(candidates: list, score_key: str) -> tuple:
             )
         )
     return tuple(signature)
+
+
+def _camera_selection_counts(candidates: list) -> dict:
+    counts = {
+        "preferred": 0,
+        "fallback_overlap": 0,
+        "no_overlap_topk": 0,
+        "other": 0,
+    }
+    for item in candidates:
+        mode = str(item.get("selection_mode", "other"))
+        if mode in counts:
+            counts[mode] += 1
+        else:
+            counts["other"] += 1
+    return counts
 
 
 def _scored_camera_to_minicam(
@@ -212,24 +277,37 @@ def _sample_scored_cameras(
     rng: Optional[torch.Generator],
     global_step: Optional[int],
 ) -> tuple:
-    """Sample ASE cameras proportionally to GaussianGPT-style chunk scores."""
+    """Sample cameras with the dataset-specific GaussianGPT Appendix C rule."""
 
+    _validate_camera_sampling_config(cfg)
     camera_cfg, _mode = _camera_sampling_config(cfg)
+    dataset_type = _camera_dataset_type(cfg)
     score_key = _camera_score_key(cfg)
+    preferred_coverage = _ase_preferred_coverage(cfg)
     temperature = max(float(camera_cfg.get("temperature", 1.0)), 1e-6)
     raw_candidates = _camera_candidates_from_sample(sample)
     candidates = [item for item in raw_candidates if "w2c" in item]
+    selection_counts = _camera_selection_counts(candidates)
     debug = {
         "source": "scoring",
+        "dataset_type": dataset_type,
         "score_key": score_key,
+        "preferred_coverage": preferred_coverage,
         "candidate_count": len(raw_candidates),
         "usable_candidate_count": len(candidates),
+        "preferred_count": selection_counts["preferred"],
+        "overlap_fallback_count": selection_counts["fallback_overlap"],
+        "no_overlap_count": selection_counts["no_overlap_topk"],
+        "preferred_triggered": selection_counts["preferred"] > 0,
         "sampled_count": 0,
         "fallback": None,
     }
     if not candidates:
-        debug["fallback"] = "missing_camera_pose_or_candidates"
-        return [], debug
+        raise RuntimeError(
+            "camera_sampling.mode=scoring,dataset_type=ase requires scored ASE "
+            "camera candidates with poses in sample metadata. Rebuild the ASE "
+            "camera cache or run the dataset with include_camera_matrices=True."
+        )
 
     score_values = []
     for item in candidates:
@@ -249,7 +327,7 @@ def _sample_scored_cameras(
 
     if score_max <= 0.0:
         probs = torch.full_like(scores, 1.0 / float(scores.numel()))
-        debug["fallback"] = "invalid_scores_uniform"
+        debug["fallback"] = "invalid_or_zero_scores_uniform"
     elif torch.allclose(scores, torch.full_like(scores, score_mean), rtol=1e-6, atol=1e-12):
         probs = torch.full_like(scores, 1.0 / float(scores.numel()))
         debug["fallback"] = "equal_scores_uniform"
@@ -321,12 +399,18 @@ def _log_camera_sampling(sample: dict, global_step: int, debug: dict) -> None:
         chunk = chunk.detach().cpu().tolist()
     print(
         "  [camera sampling] "
-        f"step={global_step} mode=scoring scene={meta.get('scene_id', '')} "
+        f"step={global_step} mode=scoring "
+        f"dataset={debug.get('dataset_type', 'ase')} "
+        f"scene={meta.get('scene_id', '')} "
         f"chunk_min={chunk} source={debug.get('source')} "
         f"candidates={debug.get('usable_candidate_count', 0)}/"
         f"{debug.get('candidate_count', 0)} "
         f"sampled={debug.get('sampled_count', 0)} "
         f"score_key={debug.get('score_key')} "
+        f"preferred>={debug.get('preferred_coverage', 0.4):.2f} "
+        f"preferred={debug.get('preferred_count', 0)} "
+        f"overlap_fallback={debug.get('overlap_fallback_count', 0)} "
+        f"no_overlap={debug.get('no_overlap_count', 0)} "
         f"score={debug.get('score_min', 0.0):.4g}/"
         f"{debug.get('score_mean', 0.0):.4g}/"
         f"{debug.get('score_max', 0.0):.4g} "
@@ -1218,6 +1302,10 @@ def train(cfg: dict, args):
     val_scene_ids = data_cfg.get("val_scene_ids")
     loss_cfg = cfg.get("loss", {})
     camera_cfg, camera_mode = _camera_sampling_config(cfg)
+    _validate_camera_sampling_config(cfg)
+    camera_dataset_type = _camera_dataset_type(cfg) if camera_mode == "scoring" else "n/a"
+    if camera_mode == "scoring":
+        preferred_coverage = _ase_preferred_coverage(cfg)
     render_n_views = _effective_render_view_count(cfg, loss_cfg)
     camera_num_candidates = _camera_candidate_count(cfg, render_n_views)
     include_camera_matrices = camera_mode == "scoring"
@@ -1226,10 +1314,12 @@ def train(cfg: dict, args):
         sampler_top_k_cameras = max(int(camera_num_candidates), int(render_n_views))
     print(
         "[camera sampling] "
-        f"mode={camera_mode} render_views={render_n_views} "
+        f"mode={camera_mode} dataset_type={camera_dataset_type} "
+        f"render_views={render_n_views} "
         f"candidate_cameras={sampler_top_k_cameras} "
         f"score_key={_camera_score_key(cfg)} "
-        f"temperature={camera_cfg.get('temperature', 1.0)}"
+        f"temperature={camera_cfg.get('temperature', 1.0)} "
+        f"preferred_coverage={preferred_coverage:.2f}"
     )
 
     train_dataset = ASEChunkDataset(

@@ -59,10 +59,12 @@ loss:
 
 camera_sampling:
   mode: "orbit"             # "orbit" keeps the existing bbox orbit cameras; "scoring" enables GaussianGPT chunk-conditioned sampling.
+  dataset_type: "ase"       # "ase" uses projected chunk-bbox coverage; "3dfront" depth-map scoring is not implemented in this ASE path.
   num_views: null           # scoring only; null falls back to loss.n_images
   num_candidates: null      # scoring only; null uses 8 * num_views per GaussianGPT Appendix C
   temperature: 1.0
   score_key: "chunk_coverage"
+  preferred_coverage: 0.4
   seed: null
   log_every: 100
 
