@@ -76,6 +76,27 @@ def patch_renderer(repo: Path) -> list[str]:
     ):
         changed.append("renderer: clamp ob_dist")
     text = read(path)
+    if 'getattr(pc, "gaussiangpt_mode", False)' not in text:
+        old = (
+            "    mask = (neural_opacity>0.0)\n"
+            "    mask = mask.view(-1)\n"
+            "\n"
+            "    # select opacity \n"
+        )
+        new = (
+            "    mask = (neural_opacity>0.0)\n"
+            "    mask = mask.view(-1)\n"
+            "    if getattr(pc, \"gaussiangpt_mode\", False) and pc.n_offsets == 1 and mask.numel() > 0 and not mask.any():\n"
+            "        neural_opacity = torch.clamp_min(neural_opacity, 1e-4)\n"
+            "        mask = torch.ones_like(mask, dtype=torch.bool)\n"
+            "\n"
+            "    # select opacity \n"
+        )
+        if old not in text:
+            raise RuntimeError(f"{path}: could not find opacity mask block")
+        write(path, text.replace(old, new, 1))
+        changed.append("renderer: gaussiangpt empty opacity fallback")
+    text = read(path)
     if '"xyz": xyz' not in text:
         old = (
             '                "selection_mask": mask,\n'
@@ -170,6 +191,32 @@ def patch_gaussian_model(repo: Path) -> list[str]:
     ):
         changed.append("gaussian_model: opacity output dim")
     text = read(path)
+    if "last.bias.fill_(0.1)" not in text:
+        insert = (
+            "        if self.gaussiangpt_mode:\n"
+            "            with torch.no_grad():\n"
+            "                last = self.mlp_opacity[-2]\n"
+            "                last.weight.zero_()\n"
+            "                last.bias.fill_(0.1)\n"
+            "\n"
+        )
+        if "    def enforce_anchor_voxel_alignment(self):\n" in text:
+            text = text.replace("    def enforce_anchor_voxel_alignment(self):\n", insert + "    def enforce_anchor_voxel_alignment(self):\n", 1)
+        else:
+            insert_after = (
+                "        self.mlp_color = nn.Sequential(\n"
+                "            nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),\n"
+                "            nn.ReLU(True),\n"
+                "            nn.Linear(feat_dim, 3*self.n_offsets),\n"
+                "            nn.Sigmoid()\n"
+                "        ).cuda()\n"
+            )
+            if insert_after not in text:
+                raise RuntimeError(f"{path}: could not find mlp_color block for opacity init")
+            text = text.replace(insert_after, insert_after + insert, 1)
+        write(path, text)
+        changed.append("gaussian_model: positive opacity init")
+    text = read(path)
     if "def enforce_anchor_voxel_alignment(self):" not in text:
         insert_after = (
             "        self.mlp_color = nn.Sequential(\n"
@@ -180,12 +227,6 @@ def patch_gaussian_model(repo: Path) -> list[str]:
             "        ).cuda()\n"
         )
         block = (
-            "        if self.gaussiangpt_mode:\n"
-            "            with torch.no_grad():\n"
-            "                last = self.mlp_opacity[-2]\n"
-            "                last.weight.zero_()\n"
-            "                last.bias.fill_(0.1)\n"
-            "\n"
             "    def enforce_anchor_voxel_alignment(self):\n"
             "        if not (self.gaussiangpt_mode and self.align_anchor_to_voxel_center):\n"
             "            return\n"
