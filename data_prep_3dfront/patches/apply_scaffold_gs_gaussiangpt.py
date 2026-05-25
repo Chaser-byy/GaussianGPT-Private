@@ -116,24 +116,10 @@ def patch_renderer(repo: Path) -> list[str]:
         write(path, text.replace(old, new, 1))
         changed.append("renderer: return debug tensors")
     text = read(path)
-    if "antialiasing=False" not in text:
-        old = (
-            "        campos=viewpoint_camera.camera_center,\n"
-            "        prefiltered=False,\n"
-            "        debug=pipe.debug\n"
-        )
-        new = (
-            "        campos=viewpoint_camera.camera_center,\n"
-            "        prefiltered=False,\n"
-            "        antialiasing=False,\n"
-            "        debug=pipe.debug\n"
-        )
-        count = text.count(old)
-        if count == 0:
-            raise RuntimeError(f"{path}: could not find raster settings blocks")
-        text = text.replace(old, new)
-        write(path, text)
-        changed.append(f"renderer: antialiasing flag ({count} blocks)")
+    if "        antialiasing=False,\n" in text:
+        count = text.count("        antialiasing=False,\n")
+        write(path, text.replace("        antialiasing=False,\n", ""))
+        changed.append(f"renderer: removed antialiasing flag ({count} blocks)")
     return changed
 
 
