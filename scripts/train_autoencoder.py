@@ -153,10 +153,15 @@ def _effective_render_view_count(cfg: dict, loss_cfg: Optional[dict] = None) -> 
     return n_views
 
 
-def _camera_candidate_count(cfg: dict, n_views: int) -> int:
-    camera_cfg, _mode = _camera_sampling_config(cfg)
+def _camera_candidate_count(cfg: dict, n_views: int) -> Optional[int]:
+    camera_cfg, mode = _camera_sampling_config(cfg)
     if camera_cfg.get("num_candidates") is not None:
-        return int(camera_cfg["num_candidates"])
+        value = int(camera_cfg["num_candidates"])
+        return value if value > 0 else None
+    if mode != "scoring":
+        return None
+    if _camera_dataset_type(cfg) == "ase":
+        return None
     return max(1, 8 * max(1, int(n_views)))
 
 
@@ -501,6 +506,7 @@ def _render_loss_for_sample(
         if torch.is_tensor(chunk_origin_value):
             chunk_origin_value = chunk_origin_value.detach().cpu().tolist()
         chunk_origin_key = tuple(int(v) for v in chunk_origin_value)
+        candidate_count_for_cache = _camera_candidate_count(cfg, n_views)
         cache_key = (
             str(meta.get("scene_id", "")),
             chunk_origin_key,
@@ -512,7 +518,8 @@ def _render_loss_for_sample(
             float(radius_factor),
             bool(upper_hemisphere_only),
             str(camera_mode),
-            int(_camera_candidate_count(cfg, n_views)) if camera_mode == "scoring" else 0,
+            (candidate_count_for_cache if candidate_count_for_cache is not None else "all")
+            if camera_mode == "scoring" else 0,
             float(camera_cfg.get("temperature", 1.0)) if camera_mode == "scoring" else 0.0,
             str(score_key) if camera_mode == "scoring" else "",
             _camera_candidate_signature(candidates, score_key)
@@ -1311,12 +1318,16 @@ def train(cfg: dict, args):
     include_camera_matrices = camera_mode == "scoring"
     sampler_top_k_cameras = top_k_cameras
     if camera_mode == "scoring":
-        sampler_top_k_cameras = max(int(camera_num_candidates), int(render_n_views))
+        if camera_dataset_type == "ase":
+            sampler_top_k_cameras = int(camera_num_candidates or 0)
+        else:
+            sampler_top_k_cameras = max(int(camera_num_candidates), int(render_n_views))
+    candidate_label = "all" if sampler_top_k_cameras <= 0 else str(sampler_top_k_cameras)
     print(
         "[camera sampling] "
         f"mode={camera_mode} dataset_type={camera_dataset_type} "
         f"render_views={render_n_views} "
-        f"candidate_cameras={sampler_top_k_cameras} "
+        f"candidate_cameras={candidate_label} "
         f"score_key={_camera_score_key(cfg)} "
         f"temperature={camera_cfg.get('temperature', 1.0)} "
         f"preferred_coverage={preferred_coverage:.2f}"

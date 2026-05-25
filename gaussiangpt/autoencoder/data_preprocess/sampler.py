@@ -29,6 +29,8 @@ def _zero_camera_score(frame: Dict) -> Dict:
         "frame_id": frame.get("frame_id"),
         "file_path": frame.get("file_path"),
         "chunk_coverage": 0.0,
+        "bbox_inside_ratio": 0.0,
+        "projected_bbox_inside_ratio": 0.0,
         "image_coverage": 0.0,
         "visible_ratio": 0.0,
         "visible_corners": 0,
@@ -78,11 +80,10 @@ def score_cameras_for_chunk(
 ) -> List[Dict]:
     """Score cameras by projected chunk bbox overlap with the image plane.
 
-    chunk_coverage follows the GaussianGPT ASE heuristic: it is the fraction of
-    the projected chunk bbox area contained by the camera image window. The
-    projected bbox is built from the chunk corners that are in front of the
-    camera and finite after projection. This is geometric scoring only; no
-    renderer visibility is implied.
+    For ASE, GaussianGPT uses a projected-bbox heuristic rather than depth-map
+    visible-area scoring. Here chunk_coverage is the clipped projected chunk
+    bbox area divided by the whole image area. bbox_inside_ratio is retained as
+    a diagnostic for the old intersection/projected-bbox-area ratio.
     """
 
     corners = _bbox_corners(chunk_world_min, chunk_world_max)
@@ -162,8 +163,8 @@ def score_cameras_for_chunk(
             intersection_area = max(0.0, inter_x_max - inter_x_min) * max(
                 0.0, inter_y_max - inter_y_min
             )
-            chunk_coverage = float(intersection_area / projected_bbox_area)
-            image_coverage = (
+            bbox_inside_ratio = float(intersection_area / projected_bbox_area)
+            chunk_coverage = (
                 float(intersection_area / image_area) if image_area > 0.0 else 0.0
             )
 
@@ -173,7 +174,9 @@ def score_cameras_for_chunk(
                 "frame_id": frame.get("frame_id"),
                 "file_path": frame.get("file_path"),
                 "chunk_coverage": chunk_coverage,
-                "image_coverage": image_coverage,
+                "bbox_inside_ratio": bbox_inside_ratio,
+                "projected_bbox_inside_ratio": bbox_inside_ratio,
+                "image_coverage": chunk_coverage,
                 "visible_ratio": visible_ratio,
                 "visible_corners": visible_corners,
                 "total_corners": total_corners,
@@ -195,15 +198,16 @@ def score_cameras_for_chunk(
                 zero_score = _attach_camera_pose(zero_score, frame, cameras)
             scores.append(zero_score)
 
-    return sorted(
+    sorted_scores = sorted(
         scores,
         key=lambda item: (
             item["chunk_coverage"],
+            item["bbox_inside_ratio"],
             item["intersection_area"],
-            item["image_coverage"],
         ),
         reverse=True,
-    )[:top_k]
+    )
+    return sorted_scores[:top_k] if top_k and top_k > 0 else sorted_scores
 
 
 def select_cameras_for_chunk(
@@ -216,11 +220,12 @@ def select_cameras_for_chunk(
 ) -> List[Dict]:
     """Select ASE cameras via GaussianGPT's projected-bbox heuristic."""
 
+    top_k_value = int(top_k) if top_k is not None else 0
     scores = score_cameras_for_chunk(
         cameras,
         chunk_world_min,
         chunk_world_max,
-        top_k=len(cameras.frames),
+        top_k=0,
         include_camera_matrices=include_camera_matrices,
     )
     preferred = [
@@ -228,6 +233,9 @@ def select_cameras_for_chunk(
         for score in scores
         if score["valid_projection"] and score["chunk_coverage"] >= preferred_coverage
     ]
+    if preferred:
+        return preferred[:top_k_value] if top_k_value > 0 else preferred
+
     fallback_overlap = [
         dict(score, selection_mode="fallback_overlap")
         for score in scores
@@ -235,14 +243,11 @@ def select_cameras_for_chunk(
         and score["intersection_area"] > 0.0
         and score["frame_index"] not in {item["frame_index"] for item in preferred}
     ]
-    selected = (preferred + fallback_overlap)[:top_k]
-    if selected:
-        return selected
+    if fallback_overlap:
+        return fallback_overlap[:top_k_value] if top_k_value > 0 else fallback_overlap
 
-    return [
-        dict(score, selection_mode="no_overlap_topk")
-        for score in scores[:top_k]
-    ]
+    fallback = [dict(score, selection_mode="no_overlap_topk") for score in scores]
+    return fallback[:top_k_value] if top_k_value > 0 else fallback
 
 
 def build_chunk_from_scene_cache(
