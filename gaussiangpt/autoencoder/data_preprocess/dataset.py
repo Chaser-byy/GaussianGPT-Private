@@ -88,6 +88,7 @@ class ASEChunkDataset:
             "chunk_shape_voxels": sample["chunk_shape_voxels"],
             "chunk_world_min": sample["chunk_world_min"],
             "chunk_world_max": sample["chunk_world_max"],
+            "scene_origin": sample["scene_origin"],
             "voxel_size": sample["voxel_size"],
             "occupancy": sample["occupancy"],
             "top_cameras": sample["top_cameras"],
