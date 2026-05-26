@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -11,15 +12,7 @@ from .ase import ASECameras, load_ase_camera_cache
 from .voxelize import load_ase_voxel_cache
 
 
-def _bbox_corners(chunk_world_min: np.ndarray, chunk_world_max: np.ndarray) -> np.ndarray:
-    lo = np.asarray(chunk_world_min, dtype=np.float32)
-    hi = np.asarray(chunk_world_max, dtype=np.float32)
-    corners = []
-    for x in (lo[0], hi[0]):
-        for y in (lo[1], hi[1]):
-            for z in (lo[2], hi[2]):
-                corners.append([x, y, z])
-    return np.asarray(corners, dtype=np.float32)
+FRUSTUM_SCORE_KEY = "frustum_image_coverage"
 
 
 def _zero_camera_score(frame: Dict) -> Dict:
@@ -28,21 +21,16 @@ def _zero_camera_score(frame: Dict) -> Dict:
         "frame_index": frame.get("frame_index"),
         "frame_id": frame.get("frame_id"),
         "file_path": frame.get("file_path"),
+        "frustum_image_coverage": 0.0,
+        # Backward-compatible aliases for older configs/log readers.
         "chunk_coverage": 0.0,
-        "bbox_inside_ratio": 0.0,
-        "projected_bbox_inside_ratio": 0.0,
         "image_coverage": 0.0,
-        "visible_ratio": 0.0,
-        "visible_corners": 0,
-        "total_corners": 8,
+        "projected_area": 0.0,
+        "image_area": 0.0,
+        "num_intersection_vertices": 0,
+        "has_overlap": False,
         "valid_projection": False,
-        "projected_bbox": None,
-        "projected_bbox_area": 0.0,
-        "intersection_area": 0.0,
-        "depth_min": None,
-        "depth_max": None,
-        "near_plane_crossing": False,
-        "selection_mode": "score_only",
+        "selection_mode": "frustum_image_coverage",
     }
 
 
@@ -71,6 +59,203 @@ def _attach_camera_pose(score: Dict, frame: Dict, cameras: ASECameras) -> Dict:
     return score
 
 
+def _aabb_world_planes_to_camera(
+    chunk_world_min: np.ndarray,
+    chunk_world_max: np.ndarray,
+    w2c: np.ndarray,
+) -> np.ndarray:
+    """Return camera-space AABB halfspaces as rows [a, b, c, d].
+
+    Each plane is ``normal dot point_cam + offset >= 0``.
+    """
+
+    c2w = np.linalg.inv(np.asarray(w2c, dtype=np.float64))
+    rotation = c2w[:3, :3]
+    translation = c2w[:3, 3]
+    lo = np.asarray(chunk_world_min, dtype=np.float64)
+    hi = np.asarray(chunk_world_max, dtype=np.float64)
+    world_planes = [
+        ([1.0, 0.0, 0.0], -lo[0]),
+        ([-1.0, 0.0, 0.0], hi[0]),
+        ([0.0, 1.0, 0.0], -lo[1]),
+        ([0.0, -1.0, 0.0], hi[1]),
+        ([0.0, 0.0, 1.0], -lo[2]),
+        ([0.0, 0.0, -1.0], hi[2]),
+    ]
+    planes = []
+    for normal_world, offset_world in world_planes:
+        normal_world = np.asarray(normal_world, dtype=np.float64)
+        normal_cam = rotation.T @ normal_world
+        offset_cam = float(normal_world @ translation + offset_world)
+        planes.append(np.concatenate([normal_cam, [offset_cam]]))
+    return np.asarray(planes, dtype=np.float64)
+
+
+def _camera_frustum_planes(
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    width: int,
+    height: int,
+    near: float = 1e-4,
+    far: Optional[float] = None,
+) -> np.ndarray:
+    planes = [
+        [0.0, 0.0, 1.0, -float(near)],
+        [float(fx), 0.0, float(cx), 0.0],
+        [-float(fx), 0.0, float(width) - float(cx), 0.0],
+        [0.0, float(fy), float(cy), 0.0],
+        [0.0, -float(fy), float(height) - float(cy), 0.0],
+    ]
+    if far is not None:
+        planes.append([0.0, 0.0, -1.0, float(far)])
+    return np.asarray(planes, dtype=np.float64)
+
+
+def _intersect_convex_polyhedron_vertices(
+    planes: np.ndarray,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    vertices = []
+    for indices in combinations(range(int(planes.shape[0])), 3):
+        subset = planes[list(indices)]
+        A = subset[:, :3]
+        b = subset[:, 3]
+        try:
+            point = np.linalg.solve(A, -b)
+        except np.linalg.LinAlgError:
+            continue
+        if not np.all(np.isfinite(point)):
+            continue
+        if np.all((planes[:, :3] @ point + planes[:, 3]) >= -eps):
+            vertices.append(point)
+    if not vertices:
+        return np.zeros((0, 3), dtype=np.float64)
+
+    unique = []
+    for point in vertices:
+        if not any(np.linalg.norm(point - existing) <= 1e-5 for existing in unique):
+            unique.append(point)
+    return np.asarray(unique, dtype=np.float64)
+
+
+def _project_cam_points(
+    points_cam: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    near: float = 1e-8,
+) -> np.ndarray:
+    points_cam = np.asarray(points_cam, dtype=np.float64)
+    valid = points_cam[:, 2] > float(near)
+    if not np.any(valid):
+        return np.zeros((0, 2), dtype=np.float64)
+    points_cam = points_cam[valid]
+    u = float(fx) * points_cam[:, 0] / points_cam[:, 2] + float(cx)
+    v = float(fy) * points_cam[:, 1] / points_cam[:, 2] + float(cy)
+    uv = np.stack([u, v], axis=1)
+    return uv[np.all(np.isfinite(uv), axis=1)]
+
+
+def _convex_hull_area_2d(points_uv: np.ndarray) -> float:
+    points = sorted({(float(p[0]), float(p[1])) for p in np.asarray(points_uv)})
+    if len(points) < 3:
+        return 0.0
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for point in points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 1e-9:
+            lower.pop()
+        lower.append(point)
+    upper = []
+    for point in reversed(points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 1e-9:
+            upper.pop()
+        upper.append(point)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return 0.0
+
+    area = 0.0
+    for idx, point in enumerate(hull):
+        nxt = hull[(idx + 1) % len(hull)]
+        area += point[0] * nxt[1] - nxt[0] * point[1]
+    return abs(area) * 0.5
+
+
+def score_camera_for_chunk_frustum_image_coverage(
+    frame: Dict,
+    cameras: ASECameras,
+    chunk_world_min: np.ndarray,
+    chunk_world_max: np.ndarray,
+    near: float = 1e-4,
+) -> Dict:
+    """Score the projected visible chunk-frustum intersection area."""
+
+    score = _zero_camera_score(frame)
+    image_area = float(cameras.width * cameras.height)
+    score["image_area"] = image_area
+    try:
+        if frame.get("w2c") is not None:
+            world_to_camera = np.asarray(frame["w2c"], dtype=np.float64)
+        else:
+            world_to_camera = np.linalg.inv(
+                np.asarray(frame["transform_matrix"], dtype=np.float64)
+            )
+        aabb_planes = _aabb_world_planes_to_camera(
+            chunk_world_min, chunk_world_max, world_to_camera
+        )
+        frustum_planes = _camera_frustum_planes(
+            cameras.fx,
+            cameras.fy,
+            cameras.cx,
+            cameras.cy,
+            cameras.width,
+            cameras.height,
+            near=near,
+        )
+        planes = np.concatenate([aabb_planes, frustum_planes], axis=0)
+        vertices_cam = _intersect_convex_polyhedron_vertices(planes)
+        score["num_intersection_vertices"] = int(vertices_cam.shape[0])
+        if vertices_cam.shape[0] < 3:
+            return score
+
+        uv = _project_cam_points(
+            vertices_cam,
+            cameras.fx,
+            cameras.fy,
+            cameras.cx,
+            cameras.cy,
+            near=near,
+        )
+        if uv.shape[0] < 3:
+            return score
+
+        projected_area = _convex_hull_area_2d(uv)
+        coverage = projected_area / image_area if image_area > 0.0 else 0.0
+        coverage = float(np.clip(coverage, 0.0, 1.0))
+        score.update(
+            {
+                "frustum_image_coverage": coverage,
+                "chunk_coverage": coverage,
+                "image_coverage": coverage,
+                "projected_area": float(projected_area),
+                "has_overlap": coverage > 0.0,
+                "valid_projection": coverage > 0.0,
+                "selection_mode": "frustum_image_coverage",
+            }
+        )
+        return score
+    except Exception as exc:
+        score["error"] = str(exc)
+        return score
+
+
 def score_cameras_for_chunk(
     cameras: ASECameras,
     chunk_world_min: np.ndarray,
@@ -78,140 +263,27 @@ def score_cameras_for_chunk(
     top_k: int = 0,
     include_camera_matrices: bool = False,
 ) -> List[Dict]:
-    """Score cameras by projected chunk bbox overlap with the image plane.
-
-    For ASE, GaussianGPT uses a projected-bbox heuristic rather than depth-map
-    visible-area scoring. Here chunk_coverage is the clipped projected chunk
-    bbox area divided by the whole image area. bbox_inside_ratio is retained as
-    a diagnostic for the old intersection/projected-bbox-area ratio. Cameras
-    are scored independently; zero-score views remain in the returned list.
-    `top_k` is accepted for backward compatibility and ignored.
-    """
+    """Score all ASE cameras by chunk-frustum projected image coverage."""
 
     del top_k
-
-    corners = _bbox_corners(chunk_world_min, chunk_world_max)
-    corners_h = np.concatenate([corners, np.ones((8, 1), dtype=np.float32)], axis=1)
-    image_area = float(cameras.width * cameras.height)
     scores: List[Dict] = []
-
     for frame in cameras.frames:
-        try:
-            if frame.get("w2c") is not None:
-                world_to_camera = np.asarray(frame["w2c"], dtype=np.float32)
-            else:
-                world_to_camera = np.linalg.inv(
-                    np.asarray(frame["transform_matrix"], dtype=np.float32)
-                ).astype(np.float32)
-            camera_points = (world_to_camera @ corners_h.T).T[:, :3]
-            depth = camera_points[:, 2]
-            depth_min = float(np.min(depth))
-            depth_max = float(np.max(depth))
-            near_plane_crossing = bool(depth_min <= 1e-6 < depth_max)
-            front = depth > 1e-6
-            if not np.any(front):
-                zero_score = _zero_camera_score(frame)
-                zero_score["depth_min"] = depth_min
-                zero_score["depth_max"] = depth_max
-                if include_camera_matrices:
-                    zero_score = _attach_camera_pose(zero_score, frame, cameras)
-                scores.append(zero_score)
-                continue
+        score = score_camera_for_chunk_frustum_image_coverage(
+            frame, cameras, chunk_world_min, chunk_world_max
+        )
+        if include_camera_matrices:
+            score = _attach_camera_pose(score, frame, cameras)
+        scores.append(score)
 
-            visible_points = camera_points[front]
-            u = cameras.fx * (visible_points[:, 0] / visible_points[:, 2]) + cameras.cx
-            v = cameras.fy * (visible_points[:, 1] / visible_points[:, 2]) + cameras.cy
-            finite = np.isfinite(u) & np.isfinite(v)
-            if not np.any(finite):
-                zero_score = _zero_camera_score(frame)
-                zero_score["depth_min"] = depth_min
-                zero_score["depth_max"] = depth_max
-                zero_score["near_plane_crossing"] = near_plane_crossing
-                if include_camera_matrices:
-                    zero_score = _attach_camera_pose(zero_score, frame, cameras)
-                scores.append(zero_score)
-                continue
-            u = u[finite]
-            v = v[finite]
-            inside_image = (u >= 0.0) & (u <= float(cameras.width)) & (v >= 0.0) & (
-                v <= float(cameras.height)
-            )
-            visible_corners = int(np.count_nonzero(inside_image))
-            total_corners = int(corners.shape[0])
-            visible_ratio = float(visible_corners / total_corners)
-
-            x_min = float(np.min(u))
-            x_max = float(np.max(u))
-            y_min = float(np.min(v))
-            y_max = float(np.max(v))
-            projected_bbox = [x_min, y_min, x_max, y_max]
-            projected_bbox_area = max(0.0, x_max - x_min) * max(0.0, y_max - y_min)
-            if projected_bbox_area <= 0.0:
-                zero_score = _zero_camera_score(frame)
-                zero_score["visible_ratio"] = visible_ratio
-                zero_score["visible_corners"] = visible_corners
-                zero_score["total_corners"] = total_corners
-                zero_score["projected_bbox"] = projected_bbox
-                zero_score["depth_min"] = depth_min
-                zero_score["depth_max"] = depth_max
-                zero_score["near_plane_crossing"] = near_plane_crossing
-                if include_camera_matrices:
-                    zero_score = _attach_camera_pose(zero_score, frame, cameras)
-                scores.append(zero_score)
-                continue
-
-            inter_x_min = max(0.0, x_min)
-            inter_x_max = min(float(cameras.width), x_max)
-            inter_y_min = max(0.0, y_min)
-            inter_y_max = min(float(cameras.height), y_max)
-            intersection_area = max(0.0, inter_x_max - inter_x_min) * max(
-                0.0, inter_y_max - inter_y_min
-            )
-            bbox_inside_ratio = float(intersection_area / projected_bbox_area)
-            chunk_coverage = (
-                float(intersection_area / image_area) if image_area > 0.0 else 0.0
-            )
-
-            score = {
-                "camera_id": frame.get("camera_id"),
-                "frame_index": frame.get("frame_index"),
-                "frame_id": frame.get("frame_id"),
-                "file_path": frame.get("file_path"),
-                "chunk_coverage": chunk_coverage,
-                "bbox_inside_ratio": bbox_inside_ratio,
-                "projected_bbox_inside_ratio": bbox_inside_ratio,
-                "image_coverage": chunk_coverage,
-                "visible_ratio": visible_ratio,
-                "visible_corners": visible_corners,
-                "total_corners": total_corners,
-                "valid_projection": True,
-                "projected_bbox": projected_bbox,
-                "projected_bbox_area": float(projected_bbox_area),
-                "intersection_area": float(intersection_area),
-                "depth_min": depth_min,
-                "depth_max": depth_max,
-                "near_plane_crossing": near_plane_crossing,
-                "selection_mode": "score_only",
-            }
-            if include_camera_matrices:
-                score = _attach_camera_pose(score, frame, cameras)
-            scores.append(score)
-        except Exception:
-            zero_score = _zero_camera_score(frame)
-            if include_camera_matrices:
-                zero_score = _attach_camera_pose(zero_score, frame, cameras)
-            scores.append(zero_score)
-
-    sorted_scores = sorted(
+    return sorted(
         scores,
         key=lambda item: (
-            item["chunk_coverage"],
-            item["bbox_inside_ratio"],
-            item["intersection_area"],
+            item[FRUSTUM_SCORE_KEY],
+            item["projected_area"],
+            item["num_intersection_vertices"],
         ),
         reverse=True,
     )
-    return sorted_scores
 
 
 def select_cameras_for_chunk(
@@ -222,13 +294,10 @@ def select_cameras_for_chunk(
     preferred_coverage: float = 0.4,
     include_camera_matrices: bool = False,
 ) -> List[Dict]:
-    """Return score-only ASE camera candidates for a chunk.
+    """Return frustum-image coverage scores for every ASE camera.
 
-    The old preferred/fallback/no-overlap selection heuristic is intentionally
-    bypassed. Downstream training samples from all pose-bearing cameras using
-    normalized chunk_coverage scores, so this function only computes and
-    returns those scores. `top_k` and `preferred_coverage` are accepted for
-    backward-compatible call sites but do not affect the result.
+    `top_k` and `preferred_coverage` are accepted for compatibility with older
+    configs, but final preferred/fallback selection happens in training.
     """
 
     del top_k, preferred_coverage
@@ -492,8 +561,8 @@ class ASEOnlineChunkSampler:
                 "pose_convention": cameras.pose_convention,
                 "uses_transform_device_camera": cameras.uses_transform_device_camera,
                 "scoring_dataset_type": "ase",
-                "score_key": "chunk_coverage",
-                "selection_mode": "score_only",
+                "score_key": FRUSTUM_SCORE_KEY,
+                "selection_mode": "frustum_image_coverage",
                 "top_cameras": top_cameras,
             },
             "z_mode": self.z_mode,

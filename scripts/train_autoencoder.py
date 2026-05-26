@@ -65,6 +65,19 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _sample_scene_origin(
+    sample: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    value = sample.get("scene_origin")
+    if value is None:
+        value = (sample.get("metadata", {}) or {}).get("scene_origin")
+    if value is None:
+        return None
+    return torch.as_tensor(value, dtype=dtype, device=device).reshape(3)
+
+
 def _build_world_positions(
     sample: dict,
     pred_offset: torch.Tensor,
@@ -74,8 +87,9 @@ def _build_world_positions(
     """Convert per-voxel offsets into absolute world-space positions.
 
     `voxel_coords` are chunk-local; `chunk_origin` (if present) shifts them
-    back into the scene's global voxel frame so that GT and reconstruction
-    live in the same coordinate system.
+    back into the scene's voxel frame. ASE voxel caches keep the world-space
+    scene origin separately, so add it back before rendering from absolute
+    camera poses.
     """
     voxel_coords = sample["voxel_coords"].to(device)
     if "chunk_origin" in sample:
@@ -83,7 +97,26 @@ def _build_world_positions(
     else:
         abs_voxel_coords = voxel_coords
     voxel_centers = (abs_voxel_coords.to(pred_offset.dtype) + 0.5) * base_voxel_size
+    scene_origin = _sample_scene_origin(sample, device, pred_offset.dtype)
+    if scene_origin is not None:
+        voxel_centers = voxel_centers + scene_origin
     return voxel_centers + pred_offset
+
+
+def _canonical_camera_score_key(score_key: str) -> str:
+    key = str(score_key).lower()
+    aliases = {
+        "frustum_image_coverage": "frustum_image_coverage",
+        "chunk_coverage": "frustum_image_coverage",
+        "image_coverage": "frustum_image_coverage",
+    }
+    if key not in aliases:
+        raise ValueError(
+            "camera_sampling.score_key must be 'frustum_image_coverage' "
+            "('chunk_coverage' is accepted as a legacy alias); "
+            f"got {score_key!r}."
+        )
+    return aliases[key]
 
 
 def _camera_sampling_config(cfg: dict) -> tuple:
@@ -126,12 +159,14 @@ def _validate_camera_sampling_config(cfg: dict) -> None:
 
     dataset_type = _camera_dataset_type(cfg)
     if dataset_type == "ase":
-        score_key = str(camera_cfg.get("score_key", "chunk_coverage"))
-        if score_key != "chunk_coverage":
+        _canonical_camera_score_key(
+            camera_cfg.get("score_key", "frustum_image_coverage")
+        )
+        temperature = float(camera_cfg.get("temperature", 1.0))
+        if temperature <= 0.0:
             raise ValueError(
-                "GaussianGPT ASE camera scoring uses projected chunk bbox "
-                "coverage. Set camera_sampling.score_key='chunk_coverage'; "
-                f"got {score_key!r}."
+                "camera_sampling.temperature must be > 0 for scoring; "
+                f"got {temperature}."
             )
         return
 
@@ -230,7 +265,14 @@ def _camera_candidate_count(cfg: dict, n_views: int) -> Optional[int]:
 
 def _camera_score_key(cfg: dict) -> str:
     camera_cfg, _mode = _camera_sampling_config(cfg)
-    return str(camera_cfg.get("score_key", "chunk_coverage"))
+    return _canonical_camera_score_key(
+        camera_cfg.get("score_key", "frustum_image_coverage")
+    )
+
+
+def _camera_preferred_coverage(cfg: dict) -> float:
+    camera_cfg, _mode = _camera_sampling_config(cfg)
+    return float(camera_cfg.get("preferred_coverage", 0.4))
 
 
 def _camera_candidates_from_sample(sample: dict) -> list:
@@ -241,10 +283,19 @@ def _camera_candidates_from_sample(sample: dict) -> list:
     return list(candidates or [])
 
 
+def _camera_int_field(item: dict, primary: str, fallback: str) -> int:
+    value = item.get(primary)
+    if value is None:
+        value = item.get(fallback)
+    if value is None:
+        return -1
+    return int(value)
+
+
 def _camera_candidate_signature(candidates: list, score_key: str) -> tuple:
     signature = []
     for item in candidates:
-        score = item.get(score_key, item.get("chunk_coverage", 0.0))
+        score = item.get(score_key, item.get("frustum_image_coverage", 0.0))
         try:
             score_value = round(float(score), 6)
         except (TypeError, ValueError):
@@ -252,7 +303,7 @@ def _camera_candidate_signature(candidates: list, score_key: str) -> tuple:
         signature.append(
             (
                 str(item.get("camera_id", "")),
-                int(item.get("frame_index", item.get("frame_id", -1)) or -1),
+                _camera_int_field(item, "frame_index", "frame_id"),
                 score_value,
             )
         )
@@ -329,7 +380,13 @@ def _sample_scored_cameras(
     camera_cfg, _mode = _camera_sampling_config(cfg)
     dataset_type = _camera_dataset_type(cfg)
     score_key = _camera_score_key(cfg)
-    temperature = max(float(camera_cfg.get("temperature", 1.0)), 1e-6)
+    temperature = float(camera_cfg.get("temperature", 1.0))
+    if temperature <= 0.0:
+        raise ValueError(
+            "camera_sampling.temperature must be > 0 for scoring; "
+            f"got {temperature}."
+        )
+    preferred_coverage = _camera_preferred_coverage(cfg)
     raw_candidates = _camera_candidates_from_sample(sample)
     candidates = [item for item in raw_candidates if "w2c" in item]
     debug = {
@@ -338,9 +395,10 @@ def _sample_scored_cameras(
         "score_key": score_key,
         "candidate_count": len(raw_candidates),
         "usable_candidate_count": len(candidates),
-        "selection_mode": "score_only",
+        "selection_mode": None,
         "sampled_count": 0,
         "fallback": None,
+        "preferred_coverage": preferred_coverage,
     }
     if not candidates:
         raise RuntimeError(
@@ -351,7 +409,7 @@ def _sample_scored_cameras(
 
     score_values = []
     for item in candidates:
-        score = item.get(score_key, item.get("chunk_coverage", 0.0))
+        score = item.get(score_key, item.get("frustum_image_coverage", 0.0))
         try:
             score = float(score)
         except (TypeError, ValueError):
@@ -366,34 +424,54 @@ def _sample_scored_cameras(
     score_mean = float(scores.mean().detach().item())
     score_sum = float(scores.sum().detach().item())
 
-    if score_sum <= 0.0:
-        probs = torch.full_like(scores, 1.0 / float(scores.numel()))
-        positive_probability_count = int(scores.numel())
-        debug["fallback"] = "all_zero_scores_uniform"
+    positive_mask = scores > 0.0
+    preferred_mask = scores >= float(preferred_coverage)
+    positive_probability_count = int(torch.count_nonzero(positive_mask).detach().item())
+    preferred_count = int(torch.count_nonzero(preferred_mask).detach().item())
+
+    if preferred_count > 0:
+        pool_mask = preferred_mask
+        debug["selection_mode"] = "preferred"
+        debug["fallback"] = None
+    elif positive_probability_count > 0:
+        pool_mask = positive_mask
+        debug["selection_mode"] = "fallback_any_overlap"
+        debug["fallback"] = "no_preferred_use_any_overlap"
     else:
-        # GaussianGPT samples proportionally to the chunk-view score. The
-        # exponent form preserves exactly-zero probabilities for zero-score
-        # cameras while allowing flatter or sharper distributions.
-        weights = scores.pow(1.0 / temperature)
-        probs = weights / weights.sum().clamp_min(1e-12)
-        positive_probability_count = int(
-            torch.count_nonzero(weights > 0.0).detach().item()
+        pool_mask = torch.ones_like(scores, dtype=torch.bool)
+        debug["selection_mode"] = "fallback_uniform_all_zero"
+        debug["fallback"] = "all_zero_scores_uniform"
+        meta = sample.get("metadata", {}) or {}
+        print(
+            "WARNING: camera_sampling.mode=scoring found no positive "
+            "frustum_image_coverage cameras; sampling uniformly from all ASE "
+            f"cameras for scene={meta.get('scene_id', '')} "
+            f"chunk_min={meta.get('chunk_min_voxel', sample.get('chunk_origin', None))}."
         )
 
-    replacement = int(n_views) > positive_probability_count
+    pool_indices = torch.nonzero(pool_mask, as_tuple=False).flatten()
+    pool_scores = scores[pool_indices]
+    if debug["selection_mode"] == "fallback_uniform_all_zero":
+        pool_probs = torch.full_like(pool_scores, 1.0 / float(pool_scores.numel()))
+    else:
+        weights = pool_scores.pow(1.0 / temperature)
+        pool_probs = weights / weights.sum().clamp_min(1e-12)
+
+    replacement = int(n_views) > int(pool_indices.numel())
     if replacement:
         debug["fallback"] = (
             f"{debug['fallback']}+replacement"
             if debug["fallback"]
-            else "positive_score_count_lt_num_views_replacement"
+            else "candidate_count_lt_num_views_replacement"
         )
     generator = _camera_sampling_generator(cfg, sample, device, rng, global_step)
-    sampled = torch.multinomial(
-        probs,
+    sampled_pool_indices = torch.multinomial(
+        pool_probs,
         int(n_views),
         replacement=replacement,
         generator=generator,
     )
+    sampled = pool_indices[sampled_pool_indices]
     sampled_indices = [int(value) for value in sampled.detach().cpu().tolist()]
     selected = [candidates[index] for index in sampled_indices]
     cameras = [
@@ -401,15 +479,46 @@ def _sample_scored_cameras(
         for item in selected
     ]
 
-    prob_min = float(probs.min().detach().item())
-    prob_max = float(probs.max().detach().item())
-    entropy = float((-(probs * torch.log(probs.clamp_min(1e-12))).sum()).detach().item())
+    full_probs = torch.zeros_like(scores)
+    full_probs[pool_indices] = pool_probs
+    prob_min = float(pool_probs.min().detach().item())
+    prob_max = float(pool_probs.max().detach().item())
+    entropy = float(
+        (-(pool_probs * torch.log(pool_probs.clamp_min(1e-12))).sum()).detach().item()
+    )
+    full_prob_values = full_probs.detach().cpu().tolist()
+    top_cameras = []
+    for index, item in enumerate(candidates[: min(len(candidates), 8)]):
+        score = float(score_values[index])
+        if preferred_count > 0:
+            selected_by = "preferred" if score >= preferred_coverage else "excluded"
+        elif positive_probability_count > 0:
+            selected_by = "fallback_any_overlap" if score > 0.0 else "excluded"
+        else:
+            selected_by = "fallback_uniform_all_zero"
+        top_cameras.append(
+            {
+                "camera_id": str(item.get("camera_id", "")),
+                "frame_index": _camera_int_field(item, "frame_index", "frame_id"),
+                "frame_id": _camera_int_field(item, "frame_id", "frame_index"),
+                "file_path": str(item.get("file_path", "")),
+                "score": score,
+                "frustum_image_coverage": score,
+                "projected_area": float(item.get("projected_area", 0.0) or 0.0),
+                "image_area": float(item.get("image_area", 0.0) or 0.0),
+                "num_intersection_vertices": int(
+                    item.get("num_intersection_vertices", 0) or 0
+                ),
+                "selected_by": selected_by,
+                "sampling_probability": float(full_prob_values[index]),
+            }
+        )
     debug.update(
         {
             "sampled_count": len(cameras),
             "sampled_indices": sampled_indices,
             "sampled_frame_indices": [
-                int(item.get("frame_index", item.get("frame_id", -1)) or -1)
+                _camera_int_field(item, "frame_index", "frame_id")
                 for item in selected
             ],
             "sampled_camera_ids": [str(item.get("camera_id", "")) for item in selected],
@@ -418,10 +527,13 @@ def _sample_scored_cameras(
             "score_mean": score_mean,
             "score_sum": score_sum,
             "positive_probability_count": positive_probability_count,
+            "preferred_count": preferred_count,
+            "selection_pool_count": int(pool_indices.numel()),
             "prob_min": prob_min,
             "prob_max": prob_max,
             "prob_entropy": entropy,
             "temperature": temperature,
+            "top_cameras": top_cameras,
         }
     )
     return cameras, debug
@@ -452,7 +564,10 @@ def _log_camera_sampling(sample: dict, global_step: int, debug: dict) -> None:
         f"{debug.get('candidate_count', 0)} "
         f"sampled={debug.get('sampled_count', 0)} "
         f"score_key={debug.get('score_key')} "
-        f"selection={debug.get('selection_mode', 'score_only')} "
+        f"selection={debug.get('selection_mode', 'unknown')} "
+        f"preferred={debug.get('preferred_count', 0)} "
+        f"positive={debug.get('positive_probability_count', 0)} "
+        f"pool={debug.get('selection_pool_count', 0)} "
         f"score={debug.get('score_min', 0.0):.4g}/"
         f"{debug.get('score_mean', 0.0):.4g}/"
         f"{debug.get('score_max', 0.0):.4g} "
@@ -463,6 +578,20 @@ def _log_camera_sampling(sample: dict, global_step: int, debug: dict) -> None:
         f"frames={debug.get('sampled_frame_indices', [])} "
         f"fallback={debug.get('fallback')}"
     )
+    for rank, item in enumerate(debug.get("top_cameras", [])[:8]):
+        print(
+            "    [camera candidate] "
+            f"rank={rank} frame_index={item.get('frame_index')} "
+            f"frame_id={item.get('frame_id')} "
+            f"file={item.get('file_path')} "
+            f"score={item.get('score', 0.0):.6g} "
+            f"frustum_image_coverage={item.get('frustum_image_coverage', 0.0):.6g} "
+            f"projected_area={item.get('projected_area', 0.0):.3f} "
+            f"image_area={item.get('image_area', 0.0):.3f} "
+            f"num_intersection_vertices={item.get('num_intersection_vertices', 0)} "
+            f"selected_by={item.get('selected_by')} "
+            f"prob={item.get('sampling_probability', 0.0):.6g}"
+        )
 
 
 def _render_loss_for_sample(
@@ -558,6 +687,7 @@ def _render_loss_for_sample(
             (candidate_count_for_cache if candidate_count_for_cache is not None else "all")
             if camera_mode == "scoring" else 0,
             float(camera_cfg.get("temperature", 1.0)) if camera_mode == "scoring" else 0.0,
+            float(_camera_preferred_coverage(cfg)) if camera_mode == "scoring" else 0.0,
             str(score_key) if camera_mode == "scoring" else "",
             _camera_candidate_signature(candidates, score_key)
             if camera_mode == "scoring"
@@ -1009,6 +1139,7 @@ def ase_batch_sample_to_legacy_sample(batch: dict, sample_index: int = 0) -> dic
     return {
         "voxel_coords": coords[mask, 1:4],
         "chunk_origin": torch.as_tensor(meta["chunk_min_voxel"], dtype=torch.long),
+        "scene_origin": meta.get("scene_origin"),
         "offset": sample_feats[:, 0:3],
         "color": sample_feats[:, 3:6],
         "opacity": sample_feats[:, 6:7],
@@ -1138,7 +1269,6 @@ def save_validation_reconstruction(
     GT, bottom row = predicted) for quick eyeballing.
     """
     voxel_coords = sample["voxel_coords"].to(device)
-    chunk_origin = sample["chunk_origin"].to(device)
     gaussians = {k: v.to(device) for k, v in sample.items()
                  if k in ("offset", "scale", "opacity", "rotation", "color", "sh")}
 
@@ -1155,9 +1285,11 @@ def save_validation_reconstruction(
     else:
         pred_voxel_coords = voxel_coords
     base_voxel_size = float(cfg["data"]["base_voxel_size"])
-    pred_abs_voxel_coords = pred_voxel_coords + chunk_origin
-    pred_voxel_centers = (pred_abs_voxel_coords.to(pred_gaussians["offset"].dtype) + 0.5) * base_voxel_size
-    pred_gaussians["position"] = pred_voxel_centers + pred_gaussians["offset"]
+    pred_sample = dict(sample)
+    pred_sample["voxel_coords"] = pred_voxel_coords
+    pred_gaussians["position"] = _build_world_positions(
+        pred_sample, pred_gaussians["offset"], base_voxel_size, device
+    )
     save_gaussians_as_ply(pred_gaussians, ply_path)
 
     # ---- Optional: render GT vs. Pred views and save as a side-by-side PNG ----
@@ -1171,9 +1303,9 @@ def save_validation_reconstruction(
     if n_views <= 0:
         return
 
-    abs_voxel_coords = voxel_coords + chunk_origin
-    voxel_centers = (abs_voxel_coords.to(gaussians["offset"].dtype) + 0.5) * base_voxel_size
-    gt_position = voxel_centers + gaussians["offset"]
+    gt_position = _build_world_positions(
+        sample, gaussians["offset"], base_voxel_size, device
+    )
     bbox_min = gt_position.min(dim=0).values
     bbox_max = gt_position.max(dim=0).values
     cameras = []
@@ -1396,14 +1528,10 @@ def train(cfg: dict, args):
     _validate_camera_sampling_config(cfg)
     camera_dataset_type = _camera_dataset_type(cfg) if camera_mode == "scoring" else "n/a"
     render_n_views = _effective_render_view_count(cfg, loss_cfg)
-    camera_num_candidates = _camera_candidate_count(cfg, render_n_views)
     include_camera_matrices = camera_mode == "scoring"
-    sampler_top_k_cameras = top_k_cameras
-    if camera_mode == "scoring":
-        if camera_dataset_type == "ase":
-            sampler_top_k_cameras = int(camera_num_candidates or 0)
-        else:
-            sampler_top_k_cameras = max(int(camera_num_candidates), int(render_n_views))
+    # ASE scoring evaluates every real camera; top_k/num_candidates remain only
+    # for legacy orbit-era configs and do not restrict scoring selection.
+    sampler_top_k_cameras = 0 if camera_mode == "scoring" else top_k_cameras
     candidate_label = "all" if sampler_top_k_cameras <= 0 else str(sampler_top_k_cameras)
     print(
         "[camera sampling] "
@@ -1412,7 +1540,8 @@ def train(cfg: dict, args):
         f"candidate_cameras={candidate_label} "
         f"score_key={_camera_score_key(cfg)} "
         f"temperature={camera_cfg.get('temperature', 1.0)} "
-        f"selection=score_only"
+        f"preferred_coverage={_camera_preferred_coverage(cfg)} "
+        f"selection=preferred_then_any_overlap_then_uniform"
     )
 
     train_dataset = ASEChunkDataset(
