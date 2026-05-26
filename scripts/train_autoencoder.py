@@ -65,6 +65,19 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _sample_scene_origin(
+    sample: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    value = sample.get("scene_origin")
+    if value is None:
+        value = (sample.get("metadata", {}) or {}).get("scene_origin")
+    if value is None:
+        return None
+    return torch.as_tensor(value, dtype=dtype, device=device).reshape(3)
+
+
 def _build_world_positions(
     sample: dict,
     pred_offset: torch.Tensor,
@@ -74,8 +87,9 @@ def _build_world_positions(
     """Convert per-voxel offsets into absolute world-space positions.
 
     `voxel_coords` are chunk-local; `chunk_origin` (if present) shifts them
-    back into the scene's global voxel frame so that GT and reconstruction
-    live in the same coordinate system.
+    back into the scene's voxel frame. ASE voxel caches keep the world-space
+    scene origin separately, so add it back when present before rendering from
+    absolute camera poses.
     """
     voxel_coords = sample["voxel_coords"].to(device)
     if "chunk_origin" in sample:
@@ -83,6 +97,9 @@ def _build_world_positions(
     else:
         abs_voxel_coords = voxel_coords
     voxel_centers = (abs_voxel_coords.to(pred_offset.dtype) + 0.5) * base_voxel_size
+    scene_origin = _sample_scene_origin(sample, device, pred_offset.dtype)
+    if scene_origin is not None:
+        voxel_centers = voxel_centers + scene_origin
     return voxel_centers + pred_offset
 
 
@@ -1009,6 +1026,7 @@ def ase_batch_sample_to_legacy_sample(batch: dict, sample_index: int = 0) -> dic
     return {
         "voxel_coords": coords[mask, 1:4],
         "chunk_origin": torch.as_tensor(meta["chunk_min_voxel"], dtype=torch.long),
+        "scene_origin": meta.get("scene_origin"),
         "offset": sample_feats[:, 0:3],
         "color": sample_feats[:, 3:6],
         "opacity": sample_feats[:, 6:7],
@@ -1138,7 +1156,6 @@ def save_validation_reconstruction(
     GT, bottom row = predicted) for quick eyeballing.
     """
     voxel_coords = sample["voxel_coords"].to(device)
-    chunk_origin = sample["chunk_origin"].to(device)
     gaussians = {k: v.to(device) for k, v in sample.items()
                  if k in ("offset", "scale", "opacity", "rotation", "color", "sh")}
 
@@ -1155,9 +1172,11 @@ def save_validation_reconstruction(
     else:
         pred_voxel_coords = voxel_coords
     base_voxel_size = float(cfg["data"]["base_voxel_size"])
-    pred_abs_voxel_coords = pred_voxel_coords + chunk_origin
-    pred_voxel_centers = (pred_abs_voxel_coords.to(pred_gaussians["offset"].dtype) + 0.5) * base_voxel_size
-    pred_gaussians["position"] = pred_voxel_centers + pred_gaussians["offset"]
+    pred_sample = dict(sample)
+    pred_sample["voxel_coords"] = pred_voxel_coords
+    pred_gaussians["position"] = _build_world_positions(
+        pred_sample, pred_gaussians["offset"], base_voxel_size, device
+    )
     save_gaussians_as_ply(pred_gaussians, ply_path)
 
     # ---- Optional: render GT vs. Pred views and save as a side-by-side PNG ----
@@ -1171,9 +1190,9 @@ def save_validation_reconstruction(
     if n_views <= 0:
         return
 
-    abs_voxel_coords = voxel_coords + chunk_origin
-    voxel_centers = (abs_voxel_coords.to(gaussians["offset"].dtype) + 0.5) * base_voxel_size
-    gt_position = voxel_centers + gaussians["offset"]
+    gt_position = _build_world_positions(
+        sample, gaussians["offset"], base_voxel_size, device
+    )
     bbox_min = gt_position.min(dim=0).values
     bbox_max = gt_position.max(dim=0).values
     cameras = []
