@@ -22,6 +22,25 @@ def _bbox_corners(chunk_world_min: np.ndarray, chunk_world_max: np.ndarray) -> n
     return np.asarray(corners, dtype=np.float32)
 
 
+def _camera_center_from_frame(frame: Dict, world_to_camera: np.ndarray) -> np.ndarray:
+    c2w = frame.get("c2w", frame.get("transform_matrix"))
+    if c2w is not None:
+        return np.asarray(c2w, dtype=np.float32)[:3, 3]
+    return np.linalg.inv(world_to_camera).astype(np.float32)[:3, 3]
+
+
+def _point_inside_bbox(
+    point: np.ndarray,
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+    eps: float = 1e-6,
+) -> bool:
+    return bool(
+        np.all(point >= np.asarray(bbox_min, dtype=np.float32) - eps)
+        and np.all(point <= np.asarray(bbox_max, dtype=np.float32) + eps)
+    )
+
+
 def _zero_camera_score(frame: Dict) -> Dict:
     return {
         "camera_id": frame.get("camera_id"),
@@ -42,6 +61,41 @@ def _zero_camera_score(frame: Dict) -> Dict:
         "depth_min": None,
         "depth_max": None,
         "near_plane_crossing": False,
+        "camera_inside_chunk": False,
+        "selection_mode": "score_only",
+    }
+
+
+def _inside_camera_score(
+    frame: Dict,
+    cameras: ASECameras,
+    depth_min: float,
+    depth_max: float,
+    near_plane_crossing: bool,
+    image_area: float,
+) -> Dict:
+    width = float(cameras.width)
+    height = float(cameras.height)
+    return {
+        "camera_id": frame.get("camera_id"),
+        "frame_index": frame.get("frame_index"),
+        "frame_id": frame.get("frame_id"),
+        "file_path": frame.get("file_path"),
+        "chunk_coverage": 1.0,
+        "bbox_inside_ratio": 1.0,
+        "projected_bbox_inside_ratio": 1.0,
+        "image_coverage": 1.0,
+        "visible_ratio": 1.0,
+        "visible_corners": 8,
+        "total_corners": 8,
+        "valid_projection": True,
+        "projected_bbox": [0.0, 0.0, width, height],
+        "projected_bbox_area": float(image_area),
+        "intersection_area": float(image_area),
+        "depth_min": depth_min,
+        "depth_max": depth_max,
+        "near_plane_crossing": near_plane_crossing,
+        "camera_inside_chunk": True,
         "selection_mode": "score_only",
     }
 
@@ -108,11 +162,32 @@ def score_cameras_for_chunk(
             depth_min = float(np.min(depth))
             depth_max = float(np.max(depth))
             near_plane_crossing = bool(depth_min <= 1e-6 < depth_max)
+            camera_center = _camera_center_from_frame(frame, world_to_camera)
+            camera_inside_chunk = _point_inside_bbox(
+                camera_center,
+                chunk_world_min,
+                chunk_world_max,
+            )
+            if camera_inside_chunk:
+                score = _inside_camera_score(
+                    frame,
+                    cameras,
+                    depth_min,
+                    depth_max,
+                    near_plane_crossing,
+                    image_area,
+                )
+                if include_camera_matrices:
+                    score = _attach_camera_pose(score, frame, cameras)
+                scores.append(score)
+                continue
+
             front = depth > 1e-6
             if not np.any(front):
                 zero_score = _zero_camera_score(frame)
                 zero_score["depth_min"] = depth_min
                 zero_score["depth_max"] = depth_max
+                zero_score["camera_inside_chunk"] = camera_inside_chunk
                 if include_camera_matrices:
                     zero_score = _attach_camera_pose(zero_score, frame, cameras)
                 scores.append(zero_score)
@@ -127,6 +202,7 @@ def score_cameras_for_chunk(
                 zero_score["depth_min"] = depth_min
                 zero_score["depth_max"] = depth_max
                 zero_score["near_plane_crossing"] = near_plane_crossing
+                zero_score["camera_inside_chunk"] = camera_inside_chunk
                 if include_camera_matrices:
                     zero_score = _attach_camera_pose(zero_score, frame, cameras)
                 scores.append(zero_score)
@@ -155,6 +231,7 @@ def score_cameras_for_chunk(
                 zero_score["depth_min"] = depth_min
                 zero_score["depth_max"] = depth_max
                 zero_score["near_plane_crossing"] = near_plane_crossing
+                zero_score["camera_inside_chunk"] = camera_inside_chunk
                 if include_camera_matrices:
                     zero_score = _attach_camera_pose(zero_score, frame, cameras)
                 scores.append(zero_score)
@@ -191,6 +268,7 @@ def score_cameras_for_chunk(
                 "depth_min": depth_min,
                 "depth_max": depth_max,
                 "near_plane_crossing": near_plane_crossing,
+                "camera_inside_chunk": camera_inside_chunk,
                 "selection_mode": "score_only",
             }
             if include_camera_matrices:
