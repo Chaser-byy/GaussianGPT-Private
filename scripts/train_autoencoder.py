@@ -12,6 +12,7 @@ import os
 import argparse
 import math
 import yaml
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -36,6 +37,40 @@ from gaussiangpt.utils.rendering import (
 )
 
 
+GAUSSIAN_FEATURE_SLICES = {
+    "offset": slice(0, 3),
+    "color": slice(3, 6),
+    "opacity": slice(6, 7),
+    "scale": slice(7, 10),
+    "rotation": slice(10, 14),
+}
+
+
+@dataclass
+class DebugOptions:
+    """Runtime debug switches, with defaults matching the configured training path."""
+
+    norm_kind: str
+    color_act: str
+    fixed_chunk: bool
+    no_augment: bool
+    voxel_dedup: str
+    grad_clip: float
+    log_grad_norm_every: int
+
+
+@dataclass
+class DataLoaders:
+    """ASE dataloaders plus the render/camera values derived while building them."""
+
+    train_loader: DataLoader
+    val_loader: DataLoader
+    loss_cfg: dict
+    camera_mode: str
+    render_n_views: int
+    fixed_chunk: bool
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/autoencoder_scene.yaml")
@@ -50,18 +85,23 @@ def parse_args():
     return parser.parse_args()
 
 
-def sparse_collate(batch):
-    """Collate function for variable-size sparse Gaussian data.
-
-    Returns a list of per-sample dicts rather than stacking tensors,
-    since the number of voxels N differs across samples.
-    """
-    return batch
-
-
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _gaussian_features_to_attrs(feats: torch.Tensor) -> dict:
+    """View ASE 14D feature rows as the attribute dict expected by the AE heads.
+
+    Feature layout is fixed by the ASE voxel cache:
+      offset[0:3], color[3:6], opacity[6:7], scale[7:10], rotation[10:14].
+    The slices are views into ``feats``; no data is copied or transformed here.
+    """
+
+    return {
+        name: feats[:, feature_slice]
+        for name, feature_slice in GAUSSIAN_FEATURE_SLICES.items()
+    }
 
 
 def _sample_scene_origin(
@@ -838,6 +878,77 @@ def _sparse_occupancy_targets(
     return occ_logits, targets, stride
 
 
+def _loss_weights(cfg: dict) -> tuple[float, float, float, float]:
+    """Return the four scalar weights used in GaussianGPT Eq. (1)."""
+
+    loss_cfg = cfg.get("loss", {})
+    return (
+        float(loss_cfg.get("lambda_rgb", 0.0)),
+        float(loss_cfg.get("lambda_perc", 0.0)),
+        float(loss_cfg.get("lambda_occ", 0.0)),
+        float(loss_cfg.get("lambda_lfq", 0.0)),
+    )
+
+
+def _render_losses_for_batch(
+    batch: dict,
+    coords: torch.Tensor,
+    pred_coords: torch.Tensor,
+    pred_gaussians: dict,
+    gt_gaussians: dict,
+    cfg: dict,
+    device: torch.device,
+    perceptual: nn.Module = None,
+    rng: torch.Generator = None,
+    gt_render_cache: Optional[dict] = None,
+    global_step: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Render per sample in a sparse batch and average over rendered samples."""
+
+    l_rgb = torch.tensor(0.0, device=device)
+    l_perc = torch.tensor(0.0, device=device)
+    gt_batch_indices = coords[:, 0]
+    pred_batch_indices = pred_coords[:, 0]
+
+    render_count = 0
+    for meta_idx, _meta in enumerate(batch["metas"]):
+        gt_mask = gt_batch_indices == meta_idx
+        pred_mask = pred_batch_indices == meta_idx
+        if not bool(gt_mask.any()) or not bool(pred_mask.any()):
+            continue
+        render_count += 1
+
+        sample_pred = {k: v[pred_mask] for k, v in pred_gaussians.items()}
+        sample_gt = {k: v[gt_mask] for k, v in gt_gaussians.items()}
+        meta_sample = {
+            "voxel_coords": coords[gt_mask, 1:4],
+            "pred_voxel_coords": pred_coords[pred_mask, 1:4],
+            "chunk_origin": torch.tensor(
+                batch["metas"][meta_idx]["chunk_min_voxel"], device=device
+            ),
+            "metadata": batch["metas"][meta_idx],
+        }
+
+        single_rgb, single_perc = _render_loss_for_sample(
+            meta_sample,
+            sample_pred,
+            sample_gt,
+            cfg,
+            device,
+            perceptual=perceptual,
+            rng=rng,
+            gt_render_cache=gt_render_cache,
+            global_step=global_step,
+        )
+        l_rgb = l_rgb + single_rgb
+        l_perc = l_perc + single_perc
+
+    if render_count > 0:
+        l_rgb = l_rgb / render_count
+        l_perc = l_perc / render_count
+    return l_rgb, l_perc
+
+
 def compute_batch_loss(
     raw_model,
     batch,
@@ -858,11 +969,7 @@ def compute_batch_loss(
 
     from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
 
-    loss_cfg = cfg.get("loss", {})
-    lambda_rgb = float(loss_cfg.get("lambda_rgb", 0.0))
-    lambda_perc = float(loss_cfg.get("lambda_perc", 0.0))
-    lambda_occ = float(loss_cfg.get("lambda_occ", 0.0))
-    lambda_lfq = float(loss_cfg.get("lambda_lfq", 0.0))
+    lambda_rgb, lambda_perc, lambda_occ, lambda_lfq = _loss_weights(cfg)
 
     coords = batch["coords"].to(device)       # (N_total, 4): [b, x, y, z]
     feats = batch["feats"].to(device)         # (N_total, 14)
@@ -873,15 +980,7 @@ def compute_batch_loss(
             "3D-coordinate path."
         )
 
-    # ASE cache feature layout, kept inline to make the training contract obvious:
-    # offset[0:3], color[3:6], opacity[6:7], scale[7:10], rotation[10:14].
-    gaussians = {
-        "offset": feats[:, 0:3],
-        "color": feats[:, 3:6],
-        "opacity": feats[:, 6:7],
-        "scale": feats[:, 7:10],
-        "rotation": feats[:, 10:14],
-    }
+    gaussians = _gaussian_features_to_attrs(feats)
 
     # Forward the full sparse batch through the model.
     pred_gaussians, occ_list, lfq_loss, indices = raw_model(
@@ -959,38 +1058,19 @@ def compute_batch_loss(
     l_perc = torch.tensor(0.0, device=device)
 
     if lambda_rgb > 0 or lambda_perc > 0:
-        # Each chunk has its own cameras/metadata, so render by batch index.
-        gt_batch_indices = coords[:, 0]
-        pred_batch_indices = pred_coords[:, 0]
-
-        render_count = 0
-        for meta_idx, _meta in enumerate(batch["metas"]):
-            gt_mask = gt_batch_indices == meta_idx
-            pred_mask = pred_batch_indices == meta_idx
-            if not bool(gt_mask.any()) or not bool(pred_mask.any()):
-                continue
-            render_count += 1
-
-            sample_pred = {k: v[pred_mask] for k, v in pred_gaussians.items()}
-            sample_gt = {k: v[gt_mask] for k, v in gaussians.items()}
-
-            meta_sample = {
-                "voxel_coords": coords[gt_mask, 1:4],
-                "pred_voxel_coords": pred_coords[pred_mask, 1:4],
-                "chunk_origin": torch.tensor(batch["metas"][meta_idx]["chunk_min_voxel"], device=device),
-                "metadata": batch["metas"][meta_idx],
-            }
-
-            single_rgb, single_perc = _render_loss_for_sample(
-                meta_sample, sample_pred, sample_gt, cfg, device,
-                perceptual=perceptual, rng=rng, gt_render_cache=gt_render_cache,
-                global_step=global_step,
-            )
-            l_rgb = l_rgb + single_rgb
-            l_perc = l_perc + single_perc
-        if render_count > 0:
-            l_rgb = l_rgb / render_count
-            l_perc = l_perc / render_count
+        l_rgb, l_perc = _render_losses_for_batch(
+            batch,
+            coords,
+            pred_coords,
+            pred_gaussians,
+            gaussians,
+            cfg,
+            device,
+            perceptual=perceptual,
+            rng=rng,
+            gt_render_cache=gt_render_cache,
+            global_step=global_step,
+        )
 
     total_loss = (
         lambda_rgb * l_rgb
@@ -1024,16 +1104,13 @@ def ase_batch_sample_to_legacy_sample(batch: dict, sample_index: int = 0) -> dic
         raise ValueError(f"ASE batch does not contain sample_index={sample_index}")
 
     sample_feats = feats[mask]
+    sample_attrs = _gaussian_features_to_attrs(sample_feats)
     meta = batch["metas"][sample_index]
     return {
         "voxel_coords": coords[mask, 1:4],
         "chunk_origin": torch.as_tensor(meta["chunk_min_voxel"], dtype=torch.long),
         "scene_origin": meta.get("scene_origin"),
-        "offset": sample_feats[:, 0:3],
-        "color": sample_feats[:, 3:6],
-        "opacity": sample_feats[:, 6:7],
-        "scale": sample_feats[:, 7:10],
-        "rotation": sample_feats[:, 10:14],
+        **sample_attrs,
         "metadata": meta,
     }
 
@@ -1339,56 +1416,72 @@ def validate(
     return avg_loss
 
 
-def train(cfg: dict, args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    n_gpus = torch.cuda.device_count()
-    print(f"Using {n_gpus} GPU(s), device: {device}")
+def _debug_options(cfg: dict) -> DebugOptions:
+    """Read debug options without changing their configured defaults."""
 
-    # ---- Debug toggles (all OFF by default = paper-faithful) ----
-    # See README / configs/autoencoder_scene.yaml for the full list.
     debug_cfg = cfg.get("debug", {}) or {}
     data_debug_cfg = cfg.get("data", {}) or {}
-    norm_kind = str(debug_cfg.get("norm", "bn")).lower()
-    color_act = str(debug_cfg.get("color_activation", "clamp")).lower()
-    fixed_chunk = bool(data_debug_cfg.get("fixed_chunk", debug_cfg.get("fixed_chunk", False)))
-    no_augment = bool(debug_cfg.get("no_augment", False))
-    voxel_dedup = str(debug_cfg.get("voxel_dedup", "random")).lower()
-    grad_clip = float(debug_cfg.get("grad_clip", 1.0))
-    log_grad_norm_every = int(debug_cfg.get("log_grad_norm_every", 0))
+    return DebugOptions(
+        norm_kind=str(debug_cfg.get("norm", "bn")).lower(),
+        color_act=str(debug_cfg.get("color_activation", "clamp")).lower(),
+        fixed_chunk=bool(
+            data_debug_cfg.get("fixed_chunk", debug_cfg.get("fixed_chunk", False))
+        ),
+        no_augment=bool(debug_cfg.get("no_augment", False)),
+        voxel_dedup=str(debug_cfg.get("voxel_dedup", "random")).lower(),
+        grad_clip=float(debug_cfg.get("grad_clip", 1.0)),
+        log_grad_norm_every=int(debug_cfg.get("log_grad_norm_every", 0)),
+    )
+
+
+def _log_debug_options(debug: DebugOptions) -> None:
     if any([
-        norm_kind != "bn",
-        color_act != "clamp",
-        fixed_chunk,
-        no_augment,
-        voxel_dedup != "random",
-        grad_clip != 1.0,
-        log_grad_norm_every > 0,
+        debug.norm_kind != "bn",
+        debug.color_act != "clamp",
+        debug.fixed_chunk,
+        debug.no_augment,
+        debug.voxel_dedup != "random",
+        debug.grad_clip != 1.0,
+        debug.log_grad_norm_every > 0,
     ]):
         print(
-            "[debug] norm=" + norm_kind
-            + f" color_activation={color_act}"
-            + f" fixed_chunk={fixed_chunk} no_augment={no_augment}"
-            + f" voxel_dedup={voxel_dedup} grad_clip={grad_clip}"
-            + f" log_grad_norm_every={log_grad_norm_every}"
+            "[debug] norm=" + debug.norm_kind
+            + f" color_activation={debug.color_act}"
+            + f" fixed_chunk={debug.fixed_chunk} no_augment={debug.no_augment}"
+            + f" voxel_dedup={debug.voxel_dedup} grad_clip={debug.grad_clip}"
+            + f" log_grad_norm_every={debug.log_grad_norm_every}"
         )
 
-    # Model
+
+def _build_model(
+    cfg: dict,
+    debug: DebugOptions,
+    device: torch.device,
+    n_gpus: int,
+) -> nn.Module:
+    """Construct the autoencoder and preserve the existing DataParallel behavior."""
+
     model = GaussianAutoencoder(
         base_ch=cfg["model"]["base_ch"],
         n_down=cfg["model"]["n_down"],
         codebook_size=cfg["model"]["codebook_size"],
         use_sh=cfg["model"].get("use_sh", False),
         voxel_size=cfg["data"]["base_voxel_size"],
-        norm=norm_kind,
-        color_activation=color_act,
+        norm=debug.norm_kind,
+        color_activation=debug.color_act,
     ).to(device)
 
     if n_gpus > 1:
         model = nn.DataParallel(model)
+    return model
 
-    # Dataset
+
+def _build_ase_dataloaders(cfg: dict, args, debug: DebugOptions) -> DataLoaders:
+    """Build ASE train/validation datasets and dataloaders from config values."""
+
     from gaussiangpt.autoencoder.data_preprocess.dataset import ASEChunkDataset
     from gaussiangpt.autoencoder.data_preprocess.collate import ase_sparse_collate
+
     data_cfg = cfg["data"]
     cache_root = args.cache_root or data_cfg.get("cache_root") or args.data_dir
     if not cache_root:
@@ -1443,10 +1536,10 @@ def train(cfg: dict, args):
         preferred_coverage=preferred_coverage,
         include_camera_matrices=include_camera_matrices,
         scene_ids=train_scene_ids,
-        fixed_chunk=fixed_chunk,
+        fixed_chunk=debug.fixed_chunk,
     )
-    fixed_sample = train_dataset.fixed_sample() if fixed_chunk else None
-    
+    fixed_sample = train_dataset.fixed_sample() if debug.fixed_chunk else None
+
     # Validation uses the same ASE chunk dataset, optionally with a distinct scene list.
     val_dataset = ASEChunkDataset(
         cache_root=cache_root,
@@ -1460,10 +1553,10 @@ def train(cfg: dict, args):
         preferred_coverage=preferred_coverage,
         include_camera_matrices=include_camera_matrices,
         scene_ids=val_scene_ids,
-        fixed_chunk=fixed_chunk,
+        fixed_chunk=debug.fixed_chunk,
         fixed_sample=fixed_sample,
     )
-    if fixed_chunk:
+    if debug.fixed_chunk:
         print("[fixed_chunk] enabled")
         summary = train_dataset.fixed_chunk_summary()
         if summary is not None:
@@ -1487,6 +1580,92 @@ def train(cfg: dict, args):
         pin_memory=bool(data_cfg.get("pin_memory", False)),
         collate_fn=ase_sparse_collate,
     )
+    return DataLoaders(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        loss_cfg=loss_cfg,
+        camera_mode=camera_mode,
+        render_n_views=render_n_views,
+        fixed_chunk=debug.fixed_chunk,
+    )
+
+
+def _build_perceptual_loss_if_needed(
+    loss_cfg: dict,
+    render_n_views: int,
+    device: torch.device,
+) -> tuple[bool, Optional[nn.Module]]:
+    """Lazily construct VGG perceptual loss only when render supervision uses it."""
+
+    use_render = (
+        float(loss_cfg.get("lambda_rgb", 0.0)) > 0.0
+        or float(loss_cfg.get("lambda_perc", 0.0)) > 0.0
+    ) and render_n_views > 0
+    perceptual = None
+    if use_render:
+        if not HAS_RASTERIZER:
+            print("WARNING: lambda_rgb/perc > 0 but diff-gaussian-rasterization "
+                  "is not importable; rendering losses will be skipped.")
+        elif device.type != "cuda":
+            print("WARNING: rendering losses require CUDA; skipping on CPU.")
+        else:
+            print(
+                f"Rendering supervision enabled: "
+                f"n_views={render_n_views} "
+                f"img={loss_cfg.get('render_size', 128)}^2 "
+                f"lambda_rgb={loss_cfg.get('lambda_rgb', 0.0)} "
+                f"lambda_perc={loss_cfg.get('lambda_perc', 0.0)}"
+            )
+            if float(loss_cfg.get("lambda_perc", 0.0)) > 0:
+                from gaussiangpt.utils.perceptual import VGGPerceptualLoss
+                perceptual = VGGPerceptualLoss(
+                    device=device,
+                    weights_path=loss_cfg.get("vgg19_weights_path"),
+                )
+    return use_render, perceptual
+
+
+def _fixed_gt_render_cache(
+    fixed_chunk: bool,
+    use_render: bool,
+    loss_cfg: dict,
+    camera_mode: str,
+    device: torch.device,
+) -> Optional[dict]:
+    """Create the fixed-chunk GT render cache when the existing conditions allow it."""
+
+    cache_fixed_gt_render = (
+        fixed_chunk
+        and use_render
+        and HAS_RASTERIZER
+        and device.type == "cuda"
+        and (
+            camera_mode == "scoring"
+            or float(loss_cfg.get("camera_jitter", 0.0)) == 0.0
+        )
+        and bool(loss_cfg.get("cache_fixed_gt_render", True))
+    )
+    if cache_fixed_gt_render:
+        print(f"[fixed_chunk] GT render cache enabled (camera_sampling={camera_mode})")
+        return {}
+    if fixed_chunk and use_render:
+        print("[fixed_chunk] GT render cache disabled")
+    return None
+
+
+def train(cfg: dict, args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_gpus = torch.cuda.device_count()
+    print(f"Using {n_gpus} GPU(s), device: {device}")
+
+    debug = _debug_options(cfg)
+    _log_debug_options(debug)
+
+    model = _build_model(cfg, debug, device, n_gpus)
+    loaders = _build_ase_dataloaders(cfg, args, debug)
+    train_loader = loaders.train_loader
+    val_loader = loaders.val_loader
+    loss_cfg = loaders.loss_cfg
 
     # Optimizer
     lr = args.lr or cfg["training"]["lr"]
@@ -1534,59 +1713,17 @@ def train(cfg: dict, args):
         voxel_size=float(cfg["data"]["base_voxel_size"]),
     )
 
-    # ---- Optional rendering / perceptual supervision ----
-    # Lazily build the VGG perceptual loss only when actually requested,
-    # so that disabling it (lambda_perc=0 or n_images=0) avoids loading
-    # ~80MB of weights and an extra GPU-side module.
-    use_render = (
-        float(loss_cfg.get("lambda_rgb", 0.0)) > 0.0
-        or float(loss_cfg.get("lambda_perc", 0.0)) > 0.0
-    ) and render_n_views > 0
-    perceptual = None
-    if use_render:
-        if not HAS_RASTERIZER:
-            print("WARNING: lambda_rgb/perc > 0 but diff-gaussian-rasterization "
-                  "is not importable; rendering losses will be skipped.")
-        elif device.type != "cuda":
-            print("WARNING: rendering losses require CUDA; skipping on CPU.")
-        else:
-            print(
-                f"Rendering supervision enabled: "
-                f"n_views={render_n_views} "
-                f"img={loss_cfg.get('render_size', 128)}^2 "
-                f"lambda_rgb={loss_cfg.get('lambda_rgb', 0.0)} "
-                f"lambda_perc={loss_cfg.get('lambda_perc', 0.0)}"
-            )
-            if float(loss_cfg.get("lambda_perc", 0.0)) > 0:
-                from gaussiangpt.utils.perceptual import VGGPerceptualLoss
-                perceptual = VGGPerceptualLoss(
-                    device=device,
-                    weights_path=loss_cfg.get("vgg19_weights_path"),
-                )
-
-    cache_fixed_gt_render = (
-        fixed_chunk
-        and use_render
-        and HAS_RASTERIZER
-        and device.type == "cuda"
-        and (
-            camera_mode == "scoring"
-            or float(loss_cfg.get("camera_jitter", 0.0)) == 0.0
-        )
-        and bool(loss_cfg.get("cache_fixed_gt_render", True))
+    use_render, perceptual = _build_perceptual_loss_if_needed(
+        loss_cfg, loaders.render_n_views, device
     )
-    gt_render_cache = {} if cache_fixed_gt_render else None
-    if cache_fixed_gt_render:
-        print(f"[fixed_chunk] GT render cache enabled (camera_sampling={camera_mode})")
-    elif fixed_chunk and use_render:
-        print("[fixed_chunk] GT render cache disabled")
+    gt_render_cache = _fixed_gt_render_cache(
+        loaders.fixed_chunk, use_render, loss_cfg, loaders.camera_mode, device
+    )
 
     for epoch in range(start_epoch, epochs):
         model.train()
         total_loss = 0.0
         for step, batch_list in enumerate(train_loader):
-            # batch_list is a list of per-sample dicts (sparse_collate)
-            # Accumulate gradients over the batch manually
             optimizer.zero_grad()
             (batch_loss, batch_occ, batch_lfq,
              batch_rgb, batch_perc) = compute_batch_loss(
@@ -1599,7 +1736,7 @@ def train(cfg: dict, args):
             # norm; logging it occasionally is one of the cheapest ways
             # to spot the "everything is being clipped" pathology.
             pre_clip_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), grad_clip,
+                model.parameters(), debug.grad_clip,
             )
             optimizer.step()
             global_step += 1
@@ -1612,12 +1749,12 @@ def train(cfg: dict, args):
                     f"rgb: {batch_rgb:.4f} perc: {batch_perc:.4f} "
                     f"occ: {batch_occ:.4f} lfq: {batch_lfq:.4f}"
                 )
-            if log_grad_norm_every > 0 and global_step % log_grad_norm_every == 0:
-                clipped = float(pre_clip_norm) > grad_clip
+            if debug.log_grad_norm_every > 0 and global_step % debug.log_grad_norm_every == 0:
+                clipped = float(pre_clip_norm) > debug.grad_clip
                 print(
                     f"  [grad] step={global_step} "
                     f"pre_clip_norm={float(pre_clip_norm):.3f} "
-                    f"clip={grad_clip:.2f} "
+                    f"clip={debug.grad_clip:.2f} "
                     f"{'(clipped)' if clipped else ''}"
                 )
 
