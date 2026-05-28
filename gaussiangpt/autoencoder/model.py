@@ -2,8 +2,7 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from .gaussian_heads import GaussianAttributeEncoder, GaussianAttributeDecoder
 from .sparse_cnn import SparseEncoder, SparseDecoder, HAS_MINKOWSKI
@@ -89,12 +88,14 @@ class GaussianAutoencoder(nn.Module):
         """
         import MinkowskiEngine as ME
         if voxel_coords.shape[1] == 4:
-        # 直接使用 collate 组装好的 [b, x, y, z] 坐标
+            # Collated ASE batches already include [batch, x, y, z] coordinates.
             return ME.SparseTensor(features=voxel_features, coordinates=voxel_coords.int())
-        else :
-            batch_idx = torch.zeros(voxel_coords.shape[0], 1, dtype=torch.int, device=voxel_coords.device)
-            coords_me = torch.cat([batch_idx, voxel_coords.int()], dim=1)  # (N, 4): [batch, x, y, z]
-            return ME.SparseTensor(features=voxel_features, coordinates=coords_me)
+
+        batch_idx = torch.zeros(
+            voxel_coords.shape[0], 1, dtype=torch.int, device=voxel_coords.device
+        )
+        coords_me = torch.cat([batch_idx, voxel_coords.int()], dim=1)
+        return ME.SparseTensor(features=voxel_features, coordinates=coords_me)
 
     def forward(
         self,

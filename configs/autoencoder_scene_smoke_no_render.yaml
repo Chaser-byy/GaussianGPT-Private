@@ -5,7 +5,7 @@ model:
   base_ch: 128           # Per L3DG Sec. 3.4 doubling rule: [128, 256, 512, 1024]
                          # (bottleneck 1024 because GaussianGPT scene cfg uses n_down=3)
   n_down: 3              # 3 downsampling stages: 2.5cm -> 5cm -> 10cm -> 20cm
-  codebook_size: 16384    # 2^12 = 4096 (12-bit LFQ)
+  codebook_size: 16384    # 2^14 = 16384 (14-bit LFQ)
   use_sh: false          # No view-dependent appearance for scenes
   # Note: GaussianGPT Appendix C predicts offsets as unbounded world-space
   # values (no L3DG-style tanh clamping), and scales via softplus.
