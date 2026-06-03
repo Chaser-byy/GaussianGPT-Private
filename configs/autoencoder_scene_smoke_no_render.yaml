@@ -48,6 +48,7 @@ loss:
 
 validation:
   prune: false              # false keeps validation on unpruned AE reconstructions.
+  prune_with_gt_logits: true # Validation decoder prune uses GT occupancy targets, not occ-head logits.
   occ_threshold: 0.5         # Same probability threshold semantics as generate.py --occ_threshold.
   prune_min_keep: 1          # Same per-stage minimum as generate.py --prune_min_keep.
 

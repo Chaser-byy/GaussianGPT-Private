@@ -68,6 +68,16 @@ def _coord_hash(coords: torch.Tensor) -> torch.Tensor:
     return key
 
 
+def _as_batched_coords(coords: torch.Tensor, device: torch.device) -> torch.Tensor:
+    coords = coords.to(device=device, dtype=torch.long)
+    if coords.dim() == 2 and coords.shape[1] == 3:
+        batch_idx = torch.zeros(
+            coords.shape[0], 1, dtype=torch.long, device=device
+        )
+        coords = torch.cat([batch_idx, coords], dim=1)
+    return coords
+
+
 def _sparse_occupancy_targets(
     occ,
     gt_coords: torch.Tensor,
@@ -77,10 +87,11 @@ def _sparse_occupancy_targets(
 ) -> tuple:
     """Align a decoder occupancy SparseTensor with the current chunk occupancy.
 
-    ``gt_coords`` are batched base-voxel coordinates ``[b, x, y, z]`` from the
-    dataloader. Each decoder occupancy head lives at its own tensor stride, so
-    GT occupied voxels are downsampled to that stage before matching against
-    ``occ.C``. The returned target has exactly one value per occupancy logit.
+    ``gt_coords`` are base-voxel coordinates from the dataloader, either
+    batched ``[b, x, y, z]`` or a single-sample ``[x, y, z]`` tensor. Each
+    decoder occupancy head lives at its own tensor stride, so GT occupied
+    voxels are downsampled to that stage before matching against ``occ.C``.
+    The returned target has exactly one value per occupancy logit.
     """
 
     occ_coords = occ.C.to(device=device, dtype=torch.long)
@@ -97,7 +108,7 @@ def _sparse_occupancy_targets(
     if occ_logits.numel() == 0:
         return occ_logits, torch.empty_like(occ_logits), stride
 
-    gt_stage_coords = gt_coords.to(device=device, dtype=torch.long).clone()
+    gt_stage_coords = _as_batched_coords(gt_coords, device).clone()
     gt_stage_coords[:, 1:] = torch.div(
         gt_stage_coords[:, 1:], stride, rounding_mode="floor"
     )
@@ -109,6 +120,36 @@ def _sparse_occupancy_targets(
     gt_hash = torch.unique(all_hash[occ_coords.shape[0]:])
     targets = torch.isin(occ_hash, gt_hash).to(dtype=occ_logits.dtype)
     return occ_logits, targets, stride
+
+
+def make_gt_prune_mask_fn(
+    gt_coords: torch.Tensor,
+    device: torch.device,
+) -> tuple:
+    """Build a decoder-stage keep-mask callback from GT occupancy coordinates."""
+
+    gt_coords = _as_batched_coords(gt_coords, device)
+    occ_target_cache = {}
+    gt_prune_debug = []
+
+    def gt_prune_mask_fn(occ, stage_idx: int, n_stages: int) -> torch.Tensor:
+        occ_logits, targets, stride = _sparse_occupancy_targets(
+            occ, gt_coords, stage_idx, n_stages, device
+        )
+        # Prune from GT occupancy targets only; occ_logits stay cached for L_occ.
+        keep = targets.to(dtype=torch.bool)
+        occ_target_cache[stage_idx] = (occ_logits, targets, stride)
+        gt_prune_debug.append(
+            {
+                "stage": stage_idx,
+                "stride": stride,
+                "pre": int(targets.numel()),
+                "post": int(keep.sum().detach().item()),
+            }
+        )
+        return keep
+
+    return gt_prune_mask_fn, occ_target_cache, gt_prune_debug
 
 
 def _loss_weights(cfg: dict) -> tuple[float, float, float, float]:
@@ -149,6 +190,7 @@ def compute_batch_loss(
     log_pruning: bool = False,
     log_prefix: str = "validation",
     train_prune_with_gt_logits: bool = False,
+    gt_prune_with_gt_logits: bool = False,
 ):
     """Compute one loss step for an ASE batch collated by ase_sparse_collate."""
 
@@ -167,32 +209,21 @@ def compute_batch_loss(
 
     gaussians = gaussian_features_to_attrs(feats)
 
-    gt_prune_enabled = bool(train_prune_with_gt_logits)
+    gt_prune_enabled = bool(train_prune_with_gt_logits or gt_prune_with_gt_logits)
     if gt_prune_enabled and not HAS_MINKOWSKI:
         raise RuntimeError(
-            "training.train_prune_with_gt_logits requires MinkowskiEngine sparse "
-            "decoder coordinates so GT occupancy targets can be aligned per stage."
+            "GT decoder pruning requires MinkowskiEngine sparse decoder coordinates "
+            "so GT occupancy targets can be aligned per stage."
         )
 
-    occ_target_cache = {}
-    gt_prune_debug = []
-
-    def gt_prune_mask_fn(occ, stage_idx: int, n_stages: int) -> torch.Tensor:
-        occ_logits, targets, stride = _sparse_occupancy_targets(
-            occ, coords, stage_idx, n_stages, device
+    if gt_prune_enabled:
+        gt_prune_mask_fn, occ_target_cache, gt_prune_debug = make_gt_prune_mask_fn(
+            coords, device
         )
-        # Prune from GT occupancy targets only; occ_logits stay cached for L_occ.
-        keep = targets.to(dtype=torch.bool)
-        occ_target_cache[stage_idx] = (occ_logits, targets, stride)
-        gt_prune_debug.append(
-            {
-                "stage": stage_idx,
-                "stride": stride,
-                "pre": int(targets.numel()),
-                "post": int(keep.sum().detach().item()),
-            }
-        )
-        return keep
+    else:
+        gt_prune_mask_fn = None
+        occ_target_cache = {}
+        gt_prune_debug = []
 
     decoder_prune_enabled = bool(decoder_prune or gt_prune_enabled)
 
@@ -203,7 +234,7 @@ def compute_batch_loss(
         prune=decoder_prune_enabled,
         occupancy_threshold=occupancy_threshold,
         min_keep=prune_min_keep,
-        prune_mask_fn=gt_prune_mask_fn if gt_prune_enabled else None,
+        prune_mask_fn=gt_prune_mask_fn,
     )
     pred_coords = pred_gaussians.pop("_coords", None)
     if pred_coords is None:

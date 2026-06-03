@@ -59,6 +59,7 @@ loss:
 
 validation:
   prune: false
+  prune_with_gt_logits: true
   occ_threshold: 0.5
   prune_min_keep: 1
 

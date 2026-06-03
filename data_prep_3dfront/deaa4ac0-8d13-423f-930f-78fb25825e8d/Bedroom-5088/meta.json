@@ -1,0 +1,635 @@
+{
+    "camera_angle_x": 0.6911111611634243,
+    "camera_lens": 50,
+    "sensor_width": 36,
+    "env_texture": "kloofendal_overcast_puresky_1k.exr",
+    "locations": [
+        {
+            "index": "0000",
+            "transform_matrix": [
+                [
+                    1.0,
+                    2.801467533215085e-23,
+                    -1.0718756196414678e-15,
+                    -3.721789925401932e-15
+                ],
+                [
+                    -1.0718756196414678e-15,
+                    -4.371138828673793e-08,
+                    -1.0,
+                    -3.472222328186035
+                ],
+                [
+                    -7.486784764107157e-23,
+                    1.0,
+                    -4.371138828673793e-08,
+                    0.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "-x-y",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0003.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0003.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0003.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0003.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        },
+        {
+            "index": "0001",
+            "transform_matrix": [
+                [
+                    1.0,
+                    1.861291241771383e-16,
+                    -1.0555913053513855e-15,
+                    -3.665247511557392e-15
+                ],
+                [
+                    -1.0718755137623494e-15,
+                    0.17364822328090668,
+                    -0.9848077297210693,
+                    -3.419471263885498
+                ],
+                [
+                    1.5177707797823786e-22,
+                    0.9848077297210693,
+                    0.17364822328090668,
+                    0.60294508934021
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "-x-y+z",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0010.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0010.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0010.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0010.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        },
+        {
+            "index": "0002",
+            "transform_matrix": [
+                [
+                    1.0,
+                    3.6660297994237404e-16,
+                    -1.0072336649970455e-15,
+                    -3.4973382645990406e-15
+                ],
+                [
+                    -1.0718756196414678e-15,
+                    0.3420201539993286,
+                    -0.9396926164627075,
+                    -3.262821674346924
+                ],
+                [
+                    8.086485659498308e-23,
+                    0.9396926164627075,
+                    0.3420201539993286,
+                    1.1875699758529663
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "-x-y+z",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0017.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0017.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0017.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0017.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        },
+        {
+            "index": "0003",
+            "transform_matrix": [
+                [
+                    0.7071068286895752,
+                    -3.374861279326069e-09,
+                    -0.7071067690849304,
+                    -2.4552319049835205
+                ],
+                [
+                    -0.7071067690849304,
+                    -5.844237804808472e-08,
+                    -0.7071068286895752,
+                    -2.4552319049835205
+                ],
+                [
+                    -3.8938612334504796e-08,
+                    1.0,
+                    -4.371138828673793e-08,
+                    0.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "-x-y",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0000.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0000.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0000.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0000.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        },
+        {
+            "index": "0004",
+            "transform_matrix": [
+                [
+                    0.9659258127212524,
+                    -2.1448732567819206e-08,
+                    -0.258819043636322,
+                    -0.8986772298812866
+                ],
+                [
+                    -0.258819043636322,
+                    -1.6292072757551068e-07,
+                    -0.9659258127212524,
+                    -3.3539090156555176
+                ],
+                [
+                    -2.144910382639864e-08,
+                    1.0,
+                    -1.6292068494294654e-07,
+                    0.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "-x-y",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0002.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0002.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0002.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0002.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        },
+        {
+            "index": "0005",
+            "transform_matrix": [
+                [
+                    0.9659258127212524,
+                    2.1448732567819206e-08,
+                    0.258819043636322,
+                    0.8986772298812866
+                ],
+                [
+                    0.258819043636322,
+                    -1.6292072757551068e-07,
+                    -0.9659258127212524,
+                    -3.3539090156555176
+                ],
+                [
+                    2.144910382639864e-08,
+                    1.0,
+                    -1.6292068494294654e-07,
+                    0.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "+x-y",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0004.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0004.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0004.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0004.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        },
+        {
+            "index": "0006",
+            "transform_matrix": [
+                [
+                    0.7071067094802856,
+                    0.12278784811496735,
+                    -0.6963642835617065,
+                    -2.417931318283081
+                ],
+                [
+                    -0.7071068286895752,
+                    0.12278764694929123,
+                    -0.6963642239570618,
+                    -2.417931318283081
+                ],
+                [
+                    -1.27977031638693e-07,
+                    0.9848077893257141,
+                    0.17364810407161713,
+                    0.60294508934021
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "-x-y+z",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0007.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0007.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0007.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0007.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        },
+        {
+            "index": "0007",
+            "transform_matrix": [
+                [
+                    0.9659258127212524,
+                    0.04494346305727959,
+                    -0.25488701462745667,
+                    -0.8850243091583252
+                ],
+                [
+                    -0.258819043636322,
+                    0.1677311807870865,
+                    -0.9512512683868408,
+                    -3.3029556274414062
+                ],
+                [
+                    -2.8577028743370647e-08,
+                    0.9848077893257141,
+                    0.17364810407161713,
+                    0.60294508934021
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "-x-y+z",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0009.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0009.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0009.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0009.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        },
+        {
+            "index": "0008",
+            "transform_matrix": [
+                [
+                    0.9659258127212524,
+                    -0.04494346305727959,
+                    0.25488701462745667,
+                    0.8850243091583252
+                ],
+                [
+                    0.258819043636322,
+                    0.1677311807870865,
+                    -0.9512512683868408,
+                    -3.3029556274414062
+                ],
+                [
+                    2.8577028743370647e-08,
+                    0.9848077893257141,
+                    0.17364810407161713,
+                    0.60294508934021
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "+x-y+z",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0011.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0011.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0011.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0011.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        },
+        {
+            "index": "0009",
+            "transform_matrix": [
+                [
+                    0.7071067094802856,
+                    -0.12278784811496735,
+                    0.6963642835617065,
+                    2.417931318283081
+                ],
+                [
+                    0.7071068286895752,
+                    0.12278764694929123,
+                    -0.6963642239570618,
+                    -2.417931318283081
+                ],
+                [
+                    1.27977031638693e-07,
+                    0.9848077893257141,
+                    0.17364810407161713,
+                    0.60294508934021
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "+x-y+z",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0013.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0013.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0013.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0013.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        },
+        {
+            "index": "0010",
+            "transform_matrix": [
+                [
+                    0.8660253882408142,
+                    0.17101000249385834,
+                    -0.4698463976383209,
+                    -1.631410837173462
+                ],
+                [
+                    -0.5000000596046448,
+                    0.2961980402469635,
+                    -0.813797652721405,
+                    -2.825686454772949
+                ],
+                [
+                    4.818645038540126e-08,
+                    0.9396926760673523,
+                    0.34202003479003906,
+                    1.1875699758529663
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "position": "-x-y+z",
+            "camera_type": "PERSP",
+            "frames": [
+                {
+                    "type": "render",
+                    "name": "render_0015.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "normal",
+                    "name": "normal_0015.webp",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "depth",
+                    "name": "depth_0015.exr",
+                    "height": 768,
+                    "width": 768
+                },
+                {
+                    "type": "render_opaque",
+                    "name": "render_opaque_0015.webp",
+                    "height": 768,
+                    "width": 768
+                }
+            ]
+        }
+    ]
+}

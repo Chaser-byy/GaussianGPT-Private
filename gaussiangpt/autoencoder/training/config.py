@@ -162,6 +162,9 @@ def validation_pruning_config(cfg: dict) -> dict:
     )
     return {
         "prune": bool(validation_cfg.get("prune", False)),
+        "prune_with_gt_logits": bool(
+            validation_cfg.get("prune_with_gt_logits", False)
+        ),
         "occ_threshold": float(occ_threshold),
         "prune_min_keep": int(prune_min_keep),
     }

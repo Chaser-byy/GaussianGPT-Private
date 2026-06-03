@@ -18,6 +18,7 @@ from gaussiangpt.autoencoder.training.gaussian_features import (
     build_world_positions,
 )
 from gaussiangpt.autoencoder.training.losses import compute_batch_loss
+from gaussiangpt.autoencoder.training.losses import make_gt_prune_mask_fn
 from gaussiangpt.autoencoder.training.render_losses import (
     HAS_RASTERIZER,
     render_gaussians,
@@ -137,6 +138,7 @@ def save_validation_reconstruction(
     prune: bool = False,
     occupancy_threshold: float = 0.5,
     prune_min_keep: int = 1,
+    gt_prune_with_gt_logits: bool = False,
 ):
     """Save a validation reconstruction.
 
@@ -148,13 +150,20 @@ def save_validation_reconstruction(
     voxel_coords = sample["voxel_coords"].to(device)
     gaussians = {k: v.to(device) for k, v in sample.items()
                  if k in ("offset", "scale", "opacity", "rotation", "color", "sh")}
+    prune_mask_fn = None
+    if gt_prune_with_gt_logits:
+        prune_mask_fn, _occ_target_cache, _gt_prune_debug = make_gt_prune_mask_fn(
+            voxel_coords, device
+        )
+    decoder_prune = bool(prune or gt_prune_with_gt_logits)
 
     pred_gaussians, _, _, _ = raw_model(
         gaussians,
         voxel_coords,
-        prune=prune,
+        prune=decoder_prune,
         occupancy_threshold=occupancy_threshold,
         min_keep=prune_min_keep,
+        prune_mask_fn=prune_mask_fn,
     )
     pred_coords = pred_gaussians.pop("_coords", None)
     if pred_coords is not None:
@@ -263,11 +272,20 @@ def validate(
     total_rgb = total_perc = 0.0
     val_prune_cfg = validation_pruning_config(cfg)
     val_prune = bool(val_prune_cfg["prune"])
+    val_gt_prune = bool(val_prune_cfg["prune_with_gt_logits"])
     val_occ_threshold = float(val_prune_cfg["occ_threshold"])
     val_prune_min_keep = int(val_prune_cfg["prune_min_keep"])
-    prediction_mode = "pruned" if val_prune else "unpruned"
+    val_decoder_prune = bool(val_prune or val_gt_prune)
+    if val_gt_prune:
+        prediction_mode = "gt-pruned"
+    elif val_prune:
+        prediction_mode = "occ-head-pruned"
+    else:
+        prediction_mode = "unpruned"
     print(
-        f"[validation pruning] enabled={val_prune} "
+        f"[validation pruning] enabled={val_decoder_prune} "
+        f"gt_prune={val_gt_prune} "
+        f"occ_head_prune={bool(val_prune and not val_gt_prune)} "
         f"occ_threshold={val_occ_threshold} prune_min_keep={val_prune_min_keep} "
         f"render_prediction={prediction_mode} saved_reconstruction={prediction_mode}"
     )
@@ -290,6 +308,7 @@ def validate(
                 gt_render_cache=gt_render_cache,
                 global_step=global_step,
                 decoder_prune=val_prune,
+                gt_prune_with_gt_logits=val_gt_prune,
                 occupancy_threshold=val_occ_threshold,
                 prune_min_keep=val_prune_min_keep,
                 log_pruning=True,
@@ -307,6 +326,7 @@ def validate(
                     prune=val_prune,
                     occupancy_threshold=val_occ_threshold,
                     prune_min_keep=val_prune_min_keep,
+                    gt_prune_with_gt_logits=val_gt_prune,
                 )
                 saved_reconstruction = True
 
