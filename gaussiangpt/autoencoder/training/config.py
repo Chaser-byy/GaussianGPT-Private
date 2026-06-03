@@ -150,6 +150,11 @@ def effective_render_view_count(cfg: dict, loss_cfg: Optional[dict] = None) -> i
     return n_views
 
 
+def model_use_generative_transpose(cfg: dict) -> bool:
+    model_cfg = cfg.get("model", {}) or {}
+    return bool(model_cfg.get("use_generative_transpose", False))
+
+
 def validation_pruning_config(cfg: dict) -> dict:
     validation_cfg = cfg.get("validation", {}) or {}
     occ_threshold = validation_cfg.get(

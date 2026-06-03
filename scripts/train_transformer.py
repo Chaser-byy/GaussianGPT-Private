@@ -109,6 +109,7 @@ def train(cfg: dict, args):
         n_down=ae_cfg["n_down"],
         codebook_size=ae_cfg["codebook_size"],
         use_sh=ae_cfg.get("use_sh", False),
+        use_generative_transpose=ae_cfg.get("use_generative_transpose", False),
     ).to(device)
     ckpt = torch.load(args.ae_checkpoint, map_location=device)
     autoencoder.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)

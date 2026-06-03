@@ -27,6 +27,7 @@ from gaussiangpt.autoencoder.training.config import (
     debug_options,
     load_config,
     log_debug_options,
+    model_use_generative_transpose,
     training_pruning_config,
 )
 from gaussiangpt.autoencoder.training.data import build_ase_dataloaders
@@ -60,14 +61,16 @@ def build_model(
 ) -> nn.Module:
     """Construct the autoencoder and preserve the existing DataParallel behavior."""
 
+    model_cfg = cfg["model"]
     model = GaussianAutoencoder(
-        base_ch=cfg["model"]["base_ch"],
-        n_down=cfg["model"]["n_down"],
-        codebook_size=cfg["model"]["codebook_size"],
-        use_sh=cfg["model"].get("use_sh", False),
+        base_ch=model_cfg["base_ch"],
+        n_down=model_cfg["n_down"],
+        codebook_size=model_cfg["codebook_size"],
+        use_sh=model_cfg.get("use_sh", False),
         voxel_size=cfg["data"]["base_voxel_size"],
         norm=debug.norm_kind,
         color_activation=debug.color_act,
+        use_generative_transpose=model_use_generative_transpose(cfg),
     ).to(device)
 
     if n_gpus > 1:
