@@ -141,14 +141,27 @@ if HAS_MINKOWSKI:
             prune: bool = False,
             occupancy_threshold: float = 0.5,
             min_keep: int = 1,
+            prune_mask_fn=None,
         ):
             x = self.proj(x)
             occ_list = []
-            for u in self.ups:
+            for stage_idx, u in enumerate(self.ups):
                 x, occ = u(x)
                 occ_list.append(occ)
                 if prune:
-                    keep = self._occupancy_keep_mask(occ, occupancy_threshold, min_keep)
+                    if prune_mask_fn is None:
+                        keep = self._occupancy_keep_mask(
+                            occ, occupancy_threshold, min_keep
+                        )
+                    else:
+                        keep = prune_mask_fn(occ, stage_idx, len(self.ups))
+                    keep = keep.to(device=occ.F.device, dtype=torch.bool)
+                    if keep.numel() != occ.F.shape[0]:
+                        raise ValueError(
+                            "Decoder prune mask length must match stage occupancy "
+                            f"logits: got {keep.numel()} mask values for "
+                            f"{occ.F.shape[0]} sparse voxels at stage {stage_idx}."
+                        )
                     x = self.pruning(x, keep)
             return self.out_proj(x), occ_list
 
@@ -236,6 +249,7 @@ else:
             prune: bool = False,
             occupancy_threshold: float = 0.5,
             min_keep: int = 1,
+            prune_mask_fn=None,
         ):
             x = self.proj(x)
             occ_list = []
@@ -248,6 +262,16 @@ else:
                 occ = self.occ_heads[i](x)
                 occ_list.append(occ)
                 if prune:
-                    keep = self._dense_keep_mask(occ, occupancy_threshold, min_keep)
+                    if prune_mask_fn is None:
+                        keep = self._dense_keep_mask(occ, occupancy_threshold, min_keep)
+                    else:
+                        keep = prune_mask_fn(occ, i, self._n_up)
+                    keep = keep.to(device=occ.device, dtype=torch.bool)
+                    if keep.shape != occ.shape:
+                        raise ValueError(
+                            "Dense decoder prune mask shape must match occupancy "
+                            f"logits: got {tuple(keep.shape)} for {tuple(occ.shape)} "
+                            f"at stage {i}."
+                        )
                     x = x * keep.to(dtype=x.dtype)
             return self.out_proj(x), occ_list

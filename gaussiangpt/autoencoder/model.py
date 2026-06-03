@@ -104,6 +104,7 @@ class GaussianAutoencoder(nn.Module):
         prune: bool = False,
         occupancy_threshold: float = 0.5,
         min_keep: int = 1,
+        prune_mask_fn=None,
     ) -> Tuple[Dict[str, torch.Tensor], List, torch.Tensor, torch.Tensor]:
         """
         Full forward pass for training.
@@ -114,6 +115,8 @@ class GaussianAutoencoder(nn.Module):
             prune: enable decoder occupancy pruning for evaluation/generation-like paths
             occupancy_threshold: occupancy probability threshold used when pruning
             min_keep: minimum voxels to keep at each decoder pruning stage
+            prune_mask_fn: optional callable returning an external keep mask per
+                decoder stage; when omitted, pruning uses occ-head logits
         Returns:
             pred_gaussians: dict of reconstructed Gaussian attributes
             occ_logits_list: list of occupancy logits per decoder upsampling stage
@@ -161,6 +164,7 @@ class GaussianAutoencoder(nn.Module):
                 prune=prune,
                 occupancy_threshold=occupancy_threshold,
                 min_keep=min_keep,
+                prune_mask_fn=prune_mask_fn,
             )
             decoded_feat = decoded_sparse.F  # (N_latent, in_ch)
             decoded_coords = decoded_sparse.C.long()
@@ -175,16 +179,20 @@ class GaussianAutoencoder(nn.Module):
                 prune=prune,
                 occupancy_threshold=occupancy_threshold,
                 min_keep=min_keep,
+                prune_mask_fn=prune_mask_fn,
             )  # (1, in_ch, gx, gy, gz)
             decoded_feat = decoded_grid[0, :, vc[:, 0], vc[:, 1], vc[:, 2]].T  # (N, in_ch)
             batch_idx = torch.zeros(vc.shape[0], 1, dtype=torch.long, device=vc.device)
             decoded_coords = torch.cat([batch_idx, vc.long()], dim=1)
             if prune and occ_list:
-                final_keep = self.decoder._dense_keep_mask(
-                    occ_list[-1],
-                    occupancy_threshold,
-                    min_keep,
-                )
+                if prune_mask_fn is None:
+                    final_keep = self.decoder._dense_keep_mask(
+                        occ_list[-1],
+                        occupancy_threshold,
+                        min_keep,
+                    )
+                else:
+                    final_keep = prune_mask_fn(occ_list[-1], len(occ_list) - 1, len(occ_list))
                 keep_at_input_coords = final_keep[0, 0, vc[:, 0], vc[:, 1], vc[:, 2]]
                 decoded_feat = decoded_feat[keep_at_input_coords]
                 decoded_coords = decoded_coords[keep_at_input_coords]

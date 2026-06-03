@@ -35,6 +35,7 @@ validation:
   prune_min_keep: 1
 
 training:
+  train_prune_with_gt_logits: true
   epochs: 100
   batch_size: 24
   lr: 1.0e-4

@@ -27,6 +27,7 @@ from gaussiangpt.autoencoder.training.config import (
     debug_options,
     load_config,
     log_debug_options,
+    training_pruning_config,
 )
 from gaussiangpt.autoencoder.training.data import build_ase_dataloaders
 from gaussiangpt.autoencoder.training.losses import compute_batch_loss
@@ -116,6 +117,16 @@ def train(cfg: dict, args):
     # Use the unwrapped model for forward; DataParallel is only safe for dense fallback.
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
     global_step = 0
+    train_prune_cfg = training_pruning_config(cfg)
+    train_gt_prune = bool(train_prune_cfg["train_prune_with_gt_logits"])
+    train_prune_min_keep = int(train_prune_cfg["train_prune_min_keep"])
+    print(
+        "[training pruning] "
+        f"gt_prune={train_gt_prune} "
+        f"source={'gt_occ_targets' if train_gt_prune else 'disabled'} "
+        f"occ_head_prune_in_training={False} "
+        f"train_prune_min_keep={train_prune_min_keep}"
+    )
 
     # ---- Per-head decoder diagnostics ----
     # Multi-line readout per `color_check_every` steps:
@@ -150,6 +161,8 @@ def train(cfg: dict, args):
                 raw_model, batch_list, cfg, device, backward=True,
                 perceptual=perceptual, gt_render_cache=gt_render_cache,
                 global_step=global_step + 1,
+                train_prune_with_gt_logits=train_gt_prune,
+                prune_min_keep=train_prune_min_keep,
             )
 
             # ``clip_grad_norm_`` returns the *pre-clip* total gradient

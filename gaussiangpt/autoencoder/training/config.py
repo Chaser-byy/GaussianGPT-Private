@@ -167,6 +167,22 @@ def validation_pruning_config(cfg: dict) -> dict:
     }
 
 
+def training_pruning_config(cfg: dict) -> dict:
+    """Return decoder pruning switches for the training forward path."""
+
+    training_cfg = cfg.get("training", {}) or {}
+    prune_min_keep = training_cfg.get(
+        "train_prune_min_keep",
+        training_cfg.get("prune_min_keep", 0),
+    )
+    return {
+        "train_prune_with_gt_logits": bool(
+            training_cfg.get("train_prune_with_gt_logits", False)
+        ),
+        "train_prune_min_keep": int(prune_min_keep),
+    }
+
+
 def camera_score_key(cfg: dict) -> str:
     camera_cfg, _mode = camera_sampling_config(cfg)
     return canonical_camera_score_key(
