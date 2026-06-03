@@ -205,6 +205,15 @@ def _validation_pruning_config(cfg: dict) -> dict:
     }
 
 
+def _training_pruning_config(cfg: dict) -> dict:
+    training_cfg = cfg.get("training", {}) or {}
+    return {
+        "train_prune_with_gt_logits": bool(
+            training_cfg.get("train_prune_with_gt_logits", False)
+        ),
+    }
+
+
 def _count_coords_by_sample(coords: Optional[torch.Tensor], n_samples: int) -> list:
     if coords is None or coords.numel() == 0:
         return [0 for _ in range(n_samples)]
@@ -839,6 +848,16 @@ def _sparse_occupancy_targets(
     return occ_logits, targets, stride
 
 
+def _should_log_gt_prune(cfg: dict, global_step: Optional[int]) -> bool:
+    if global_step is None:
+        return False
+    if int(global_step) == 1:
+        return True
+    debug_cfg = cfg.get("debug", {}) or {}
+    every = int(debug_cfg.get("gt_prune_check_every", debug_cfg.get("occ_check_every", 0)))
+    return every > 0 and int(global_step) % every == 0
+
+
 # def compute_batch_loss(
 #     raw_model,
 #     batch_list,
@@ -961,6 +980,7 @@ def compute_batch_loss(
     prune_min_keep: int = 1,
     log_pruning: bool = False,
     log_prefix: str = "validation",
+    train_prune_with_gt_logits: bool = False,
 ):
     from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
 
@@ -989,13 +1009,43 @@ def compute_batch_loss(
         "rotation": feats[:, 10:14]
     }
 
+    gt_prune_enabled = bool(train_prune_with_gt_logits)
+    if gt_prune_enabled and not HAS_MINKOWSKI:
+        raise RuntimeError(
+            "training.train_prune_with_gt_logits requires MinkowskiEngine sparse "
+            "decoder coordinates so GT occupancy targets can be aligned per stage."
+        )
+
+    occ_target_cache = {}
+    gt_prune_debug = []
+
+    def gt_prune_mask_fn(occ, stage_idx: int, n_stages: int) -> torch.Tensor:
+        occ_logits, targets, stride = _sparse_occupancy_targets(
+            occ, coords, stage_idx, n_stages, device
+        )
+        # Prune from GT occupancy targets only; occ_logits stay cached for L_occ.
+        keep = targets.to(dtype=torch.bool)
+        occ_target_cache[stage_idx] = (occ_logits, targets, stride)
+        gt_prune_debug.append(
+            {
+                "stage": stage_idx,
+                "stride": stride,
+                "pre": int(targets.numel()),
+                "post": int(keep.sum().detach().item()),
+            }
+        )
+        return keep
+
+    decoder_prune_enabled = bool(decoder_prune or gt_prune_enabled)
+
     # 3. 彻底告别 for 循环！整个 Batch 放入 Sparse CNN 一把梭完成前向推理
     pred_gaussians, occ_list, lfq_loss, indices = raw_model(
         gaussians,
         coords,
-        prune=decoder_prune,
+        prune=decoder_prune_enabled,
         occupancy_threshold=occupancy_threshold,
         min_keep=prune_min_keep,
+        prune_mask_fn=gt_prune_mask_fn if gt_prune_enabled else None,
     )
     pred_coords = pred_gaussians.pop("_coords", None)
     if pred_coords is None:
@@ -1006,8 +1056,22 @@ def compute_batch_loss(
             coords,
             pred_coords,
             occ_list,
-            decoder_prune,
+            decoder_prune_enabled,
             log_prefix,
+        )
+    if gt_prune_enabled and gt_prune_debug and _should_log_gt_prune(cfg, global_step):
+        pieces = [
+            (
+                f"s{item['stage']}:stride={item['stride']} "
+                f"pre_voxels={item['pre']} post_voxels={item['post']}"
+            )
+            for item in gt_prune_debug
+        ]
+        print(
+            f"  [gt prune] step={global_step} "
+            f"enabled=True source=gt_occ_targets "
+            f"gt_voxels={int(coords.shape[0])} "
+            + " | ".join(pieces)
         )
 
     # ---- L_occ 占位损失计算 ----
@@ -1016,9 +1080,13 @@ def compute_batch_loss(
     occ_stage_count = 0
     if occ_list:
         for stage_idx, occ in enumerate(occ_list):
-            occ_logits, targets, stride = _sparse_occupancy_targets(
-                occ, coords, stage_idx, len(occ_list), device
-            )
+            cached_targets = occ_target_cache.get(stage_idx)
+            if cached_targets is None:
+                occ_logits, targets, stride = _sparse_occupancy_targets(
+                    occ, coords, stage_idx, len(occ_list), device
+                )
+            else:
+                occ_logits, targets, stride = cached_targets
             if occ_logits.numel() == 0:
                 continue
             stage_loss = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -1668,6 +1736,14 @@ def train(cfg: dict, args):
     # Use the unwrapped model for forward; DataParallel is only safe for dense fallback.
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
     global_step = 0
+    train_prune_cfg = _training_pruning_config(cfg)
+    train_gt_prune = bool(train_prune_cfg["train_prune_with_gt_logits"])
+    print(
+        "[training pruning] "
+        f"gt_prune={train_gt_prune} "
+        f"source={'gt_occ_targets' if train_gt_prune else 'disabled'} "
+        f"occ_head_prune_in_training={False}"
+    )
 
     # ---- Per-head decoder diagnostics ----
     # Multi-line readout per `color_check_every` steps:
@@ -1744,6 +1820,7 @@ def train(cfg: dict, args):
                 raw_model, batch_list, cfg, device, backward=True,
                 perceptual=perceptual, gt_render_cache=gt_render_cache,
                 global_step=global_step + 1,
+                train_prune_with_gt_logits=train_gt_prune,
             )
 
             # ``clip_grad_norm_`` returns the *pre-clip* total gradient
