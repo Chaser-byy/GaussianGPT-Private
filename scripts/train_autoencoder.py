@@ -207,10 +207,15 @@ def _validation_pruning_config(cfg: dict) -> dict:
 
 def _training_pruning_config(cfg: dict) -> dict:
     training_cfg = cfg.get("training", {}) or {}
-    return {
-        "train_prune_with_gt_logits": bool(
-            training_cfg.get("train_prune_with_gt_logits", False)
+    decoder_prune_with_gt_occ = training_cfg.get(
+        "decoder_prune_with_gt_occ",
+        training_cfg.get(
+            "prune_with_gt_occ",
+            training_cfg.get("train_prune_with_gt_logits", False),
         ),
+    )
+    return {
+        "decoder_prune_with_gt_occ": bool(decoder_prune_with_gt_occ),
     }
 
 
@@ -245,6 +250,7 @@ def _log_validation_pruning_counts(
     occ_list: list,
     prune: bool,
     log_prefix: str,
+    source: str = "disabled",
 ) -> None:
     n_samples = len(batch.get("metas", [])) or 1
     gt_counts = _count_coords_by_sample(gt_coords, n_samples)
@@ -254,7 +260,7 @@ def _log_validation_pruning_counts(
     for sample_idx in range(n_samples):
         print(
             f"  [{log_prefix} pruning] sample={sample_idx} "
-            f"mode={mode} gt_voxels={gt_counts[sample_idx]} "
+            f"mode={mode} source={source} gt_voxels={gt_counts[sample_idx]} "
             f"pre_voxels={pre_counts[sample_idx]} post_voxels={post_counts[sample_idx]} "
             f"pre_gaussians={pre_counts[sample_idx]} post_gaussians={post_counts[sample_idx]}"
         )
@@ -848,6 +854,55 @@ def _sparse_occupancy_targets(
     return occ_logits, targets, stride
 
 
+def _batched_sparse_coords(coords: torch.Tensor, device: torch.device) -> torch.Tensor:
+    coords = coords.to(device=device, dtype=torch.long)
+    if coords.dim() != 2 or coords.shape[1] not in (3, 4):
+        raise ValueError(
+            "GT occupancy coordinates must be a 2D tensor with shape "
+            f"[N, 3] or [N, 4], got {tuple(coords.shape)}."
+        )
+    if coords.shape[1] == 4:
+        return coords
+    batch_idx = torch.zeros(coords.shape[0], 1, dtype=torch.long, device=device)
+    return torch.cat([batch_idx, coords], dim=1)
+
+
+def _make_gt_prune_mask_fn(
+    coords: torch.Tensor,
+    device: torch.device,
+    occ_target_cache: Optional[dict] = None,
+    debug_list: Optional[list] = None,
+):
+    gt_coords = _batched_sparse_coords(coords, device)
+    if occ_target_cache is None:
+        occ_target_cache = {}
+
+    def prune_mask_fn(occ, stage_idx: int, n_stages: int) -> torch.Tensor:
+        if not hasattr(occ, "C") or not hasattr(occ, "F"):
+            raise RuntimeError(
+                "training.decoder_prune_with_gt_occ requires a MinkowskiEngine "
+                "SparseTensor occupancy head. Dense fallback GT pruning is not "
+                "supported."
+            )
+        occ_logits, targets, stride = _sparse_occupancy_targets(
+            occ, gt_coords, stage_idx, n_stages, device
+        )
+        keep = targets.to(dtype=torch.bool)
+        occ_target_cache[stage_idx] = (occ_logits, targets, stride)
+        if debug_list is not None:
+            debug_list.append(
+                {
+                    "stage": stage_idx,
+                    "stride": stride,
+                    "pre": int(targets.numel()),
+                    "post": int(keep.sum().detach().item()),
+                }
+            )
+        return keep
+
+    return prune_mask_fn
+
+
 def _should_log_gt_prune(cfg: dict, global_step: Optional[int]) -> bool:
     if global_step is None:
         return False
@@ -980,7 +1035,7 @@ def compute_batch_loss(
     prune_min_keep: int = 1,
     log_pruning: bool = False,
     log_prefix: str = "validation",
-    train_prune_with_gt_logits: bool = False,
+    decoder_prune_with_gt_occ: bool = False,
 ):
     from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
 
@@ -1009,34 +1064,30 @@ def compute_batch_loss(
         "rotation": feats[:, 10:14]
     }
 
-    gt_prune_enabled = bool(train_prune_with_gt_logits)
+    gt_prune_enabled = bool(decoder_prune_with_gt_occ)
     if gt_prune_enabled and not HAS_MINKOWSKI:
         raise RuntimeError(
-            "training.train_prune_with_gt_logits requires MinkowskiEngine sparse "
+            "training.decoder_prune_with_gt_occ requires MinkowskiEngine sparse "
             "decoder coordinates so GT occupancy targets can be aligned per stage."
         )
 
     occ_target_cache = {}
     gt_prune_debug = []
-
-    def gt_prune_mask_fn(occ, stage_idx: int, n_stages: int) -> torch.Tensor:
-        occ_logits, targets, stride = _sparse_occupancy_targets(
-            occ, coords, stage_idx, n_stages, device
+    gt_prune_mask_fn = None
+    if gt_prune_enabled:
+        gt_prune_mask_fn = _make_gt_prune_mask_fn(
+            coords,
+            device,
+            occ_target_cache=occ_target_cache,
+            debug_list=gt_prune_debug,
         )
-        # Prune from GT occupancy targets only; occ_logits stay cached for L_occ.
-        keep = targets.to(dtype=torch.bool)
-        occ_target_cache[stage_idx] = (occ_logits, targets, stride)
-        gt_prune_debug.append(
-            {
-                "stage": stage_idx,
-                "stride": stride,
-                "pre": int(targets.numel()),
-                "post": int(keep.sum().detach().item()),
-            }
-        )
-        return keep
 
     decoder_prune_enabled = bool(decoder_prune or gt_prune_enabled)
+    pruning_source = (
+        "gt_occ_targets"
+        if gt_prune_enabled
+        else ("occ_head_logits" if decoder_prune_enabled else "disabled")
+    )
 
     # 3. 彻底告别 for 循环！整个 Batch 放入 Sparse CNN 一把梭完成前向推理
     pred_gaussians, occ_list, lfq_loss, indices = raw_model(
@@ -1058,6 +1109,7 @@ def compute_batch_loss(
             occ_list,
             decoder_prune_enabled,
             log_prefix,
+            source=pruning_source,
         )
     if gt_prune_enabled and gt_prune_debug and _should_log_gt_prune(cfg, global_step):
         pieces = [
@@ -1328,6 +1380,7 @@ def save_validation_reconstruction(
     prune: bool = False,
     occupancy_threshold: float = 0.5,
     prune_min_keep: int = 1,
+    decoder_prune_with_gt_occ: bool = False,
 ):
     """Save a validation reconstruction.
 
@@ -1336,16 +1389,31 @@ def save_validation_reconstruction(
     GT and predicted Gaussians and saves them as a 2-row PNG (top row =
     GT, bottom row = predicted) for quick eyeballing.
     """
+    from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
+
     voxel_coords = sample["voxel_coords"].to(device)
     gaussians = {k: v.to(device) for k, v in sample.items()
                  if k in ("offset", "scale", "opacity", "rotation", "color", "sh")}
+    gt_prune_enabled = bool(decoder_prune_with_gt_occ)
+    if gt_prune_enabled and not HAS_MINKOWSKI:
+        raise RuntimeError(
+            "training.decoder_prune_with_gt_occ requires MinkowskiEngine sparse "
+            "decoder coordinates so GT occupancy targets can be aligned per stage."
+        )
+    gt_prune_mask_fn = (
+        _make_gt_prune_mask_fn(voxel_coords, device)
+        if gt_prune_enabled
+        else None
+    )
+    decoder_prune_enabled = bool(prune or gt_prune_enabled)
 
     pred_gaussians, _, _, _ = raw_model(
         gaussians,
         voxel_coords,
-        prune=prune,
+        prune=decoder_prune_enabled,
         occupancy_threshold=occupancy_threshold,
         min_keep=prune_min_keep,
+        prune_mask_fn=gt_prune_mask_fn,
     )
     pred_coords = pred_gaussians.pop("_coords", None)
     if pred_coords is not None:
@@ -1456,9 +1524,17 @@ def validate(
     val_prune = bool(val_prune_cfg["prune"])
     val_occ_threshold = float(val_prune_cfg["occ_threshold"])
     val_prune_min_keep = int(val_prune_cfg["prune_min_keep"])
-    prediction_mode = "pruned" if val_prune else "unpruned"
+    val_gt_prune = bool(_training_pruning_config(cfg)["decoder_prune_with_gt_occ"])
+    effective_val_prune = bool(val_prune or val_gt_prune)
+    pruning_source = (
+        "gt_occ_targets"
+        if val_gt_prune
+        else ("occ_head_logits" if val_prune else "disabled")
+    )
+    prediction_mode = "pruned" if effective_val_prune else "unpruned"
     print(
-        f"[validation pruning] enabled={val_prune} "
+        f"[validation pruning] enabled={effective_val_prune} source={pruning_source} "
+        f"validation.prune={val_prune} "
         f"occ_threshold={val_occ_threshold} prune_min_keep={val_prune_min_keep} "
         f"render_prediction={prediction_mode} saved_reconstruction={prediction_mode}"
     )
@@ -1485,6 +1561,7 @@ def validate(
                 prune_min_keep=val_prune_min_keep,
                 log_pruning=True,
                 log_prefix=f"validation batch={val_batch_idx}",
+                decoder_prune_with_gt_occ=val_gt_prune,
             )
             total_loss += batch_loss.item()
             total_occ += batch_occ
@@ -1498,6 +1575,7 @@ def validate(
                     prune=val_prune,
                     occupancy_threshold=val_occ_threshold,
                     prune_min_keep=val_prune_min_keep,
+                    decoder_prune_with_gt_occ=val_gt_prune,
                 )
                 saved_reconstruction = True
 
@@ -1737,10 +1815,10 @@ def train(cfg: dict, args):
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
     global_step = 0
     train_prune_cfg = _training_pruning_config(cfg)
-    train_gt_prune = bool(train_prune_cfg["train_prune_with_gt_logits"])
+    train_gt_prune = bool(train_prune_cfg["decoder_prune_with_gt_occ"])
     print(
         "[training pruning] "
-        f"gt_prune={train_gt_prune} "
+        f"decoder_prune_with_gt_occ={train_gt_prune} "
         f"source={'gt_occ_targets' if train_gt_prune else 'disabled'} "
         f"occ_head_prune_in_training={False}"
     )
@@ -1820,7 +1898,7 @@ def train(cfg: dict, args):
                 raw_model, batch_list, cfg, device, backward=True,
                 perceptual=perceptual, gt_render_cache=gt_render_cache,
                 global_step=global_step + 1,
-                train_prune_with_gt_logits=train_gt_prune,
+                decoder_prune_with_gt_occ=train_gt_prune,
             )
 
             # ``clip_grad_norm_`` returns the *pre-clip* total gradient

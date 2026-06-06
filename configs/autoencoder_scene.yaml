@@ -64,7 +64,7 @@ camera_sampling:
   log_every: 100
 
 training:
-  train_prune_with_gt_logits: true  # Training decoder prune uses GT occupancy targets, not occ-head logits.
+  decoder_prune_with_gt_occ: false  # true uses GT occupancy targets for decoder pruning in train/val.
   epochs: 6000
   batch_size: 4             # paper: effective 8 with 4 GPUs
   lr: 1.0e-4

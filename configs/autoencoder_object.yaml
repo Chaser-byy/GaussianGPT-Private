@@ -35,7 +35,7 @@ validation:
   prune_min_keep: 1
 
 training:
-  train_prune_with_gt_logits: true
+  decoder_prune_with_gt_occ: false  # true uses GT occupancy targets for decoder pruning in train/val.
   epochs: 100
   batch_size: 24
   lr: 1.0e-4
