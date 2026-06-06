@@ -104,13 +104,16 @@ def train(cfg: dict, args):
 
     # Load autoencoder (frozen)
     ae_cfg = cfg["autoencoder"]
+    ckpt = torch.load(args.ae_checkpoint, map_location=device)
+    use_generative_transpose = bool(ae_cfg.get("use_generative_transpose", False))
+    print(f"[autoencoder] use_generative_transpose={use_generative_transpose}")
     autoencoder = GaussianAutoencoder(
         base_ch=ae_cfg["base_ch"],
         n_down=ae_cfg["n_down"],
         codebook_size=ae_cfg["codebook_size"],
         use_sh=ae_cfg.get("use_sh", False),
+        use_generative_transpose=use_generative_transpose,
     ).to(device)
-    ckpt = torch.load(args.ae_checkpoint, map_location=device)
     autoencoder.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
     autoencoder.eval()
     for p in autoencoder.parameters():

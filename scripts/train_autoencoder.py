@@ -1176,6 +1176,21 @@ def compute_batch_loss(
                 f"gt_voxels={int(coords.shape[0])} "
                 + " | ".join(pieces)
             )
+            use_generative_transpose = bool(
+                cfg.get("model", {}).get("use_generative_transpose", False)
+            )
+            if not use_generative_transpose:
+                has_full_stride1_stage = any(
+                    int(item["stride"]) == 1 and float(item["ratio"]) >= 1.0
+                    for item in occ_debug
+                )
+                if has_full_stride1_stage:
+                    print(
+                        "  [occ target warning] stride=1 occupancy targets are "
+                        "all positive; ordinary transpose convolution may be "
+                        "seeing only GT occupied coordinates. Consider "
+                        "model.use_generative_transpose=true."
+                    )
 
     # ---- L_LFQ 量化离散损失 ----
     l_lfq = torch.nn.functional.softplus(lfq_loss + 5.0)
@@ -1632,6 +1647,10 @@ def train(cfg: dict, args):
         )
 
     # Model
+    use_generative_transpose = bool(
+        cfg.get("model", {}).get("use_generative_transpose", False)
+    )
+    print(f"[model] use_generative_transpose={use_generative_transpose}")
     model = GaussianAutoencoder(
         base_ch=cfg["model"]["base_ch"],
         n_down=cfg["model"]["n_down"],
@@ -1640,6 +1659,7 @@ def train(cfg: dict, args):
         voxel_size=cfg["data"]["base_voxel_size"],
         norm=norm_kind,
         color_activation=color_act,
+        use_generative_transpose=use_generative_transpose,
     ).to(device)
 
     if n_gpus > 1:

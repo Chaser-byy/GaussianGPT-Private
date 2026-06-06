@@ -6,6 +6,7 @@ model:
   n_down: 2              # 2 downsampling stages for objects
   codebook_size: 4096
   use_sh: true           # First-order spherical harmonics for objects
+  use_generative_transpose: false  # true lets decoder upsampling generate candidate coords for occupancy/pruning.
   # Note: GaussianGPT Appendix C predicts offsets as unbounded world-space
   # values (no L3DG-style tanh clamping), and scales via softplus.
 

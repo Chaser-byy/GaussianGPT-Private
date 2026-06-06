@@ -68,10 +68,49 @@ if HAS_MINKOWSKI:
         def forward(self, x):
             return self.res(self.relu(self.bn(self.conv(x))))
 
+    def _make_transpose_conv(
+        in_ch: int,
+        out_ch: int,
+        use_generative_transpose: bool,
+    ) -> nn.Module:
+        if not use_generative_transpose:
+            return ME.MinkowskiConvolutionTranspose(
+                in_ch, out_ch, kernel_size=2, stride=2, dimension=3
+            )
+        if hasattr(ME, "MinkowskiGenerativeConvolutionTranspose"):
+            return ME.MinkowskiGenerativeConvolutionTranspose(
+                in_ch, out_ch, kernel_size=2, stride=2, dimension=3
+            )
+        try:
+            return ME.MinkowskiConvolutionTranspose(
+                in_ch,
+                out_ch,
+                kernel_size=2,
+                stride=2,
+                dimension=3,
+                expand_coordinates=True,
+            )
+        except TypeError as exc:
+            raise RuntimeError(
+                "use_generative_transpose=True requires a MinkowskiEngine "
+                "version with MinkowskiGenerativeConvolutionTranspose or "
+                "MinkowskiConvolutionTranspose(expand_coordinates=True)."
+            ) from exc
+
     class SparseUpBlock(nn.Module):
-        def __init__(self, in_ch: int, out_ch: int, norm: str = "bn"):
+        def __init__(
+            self,
+            in_ch: int,
+            out_ch: int,
+            norm: str = "bn",
+            use_generative_transpose: bool = False,
+        ):
             super().__init__()
-            self.conv = ME.MinkowskiConvolutionTranspose(in_ch, out_ch, kernel_size=2, stride=2, dimension=3)
+            self.conv = _make_transpose_conv(
+                in_ch,
+                out_ch,
+                use_generative_transpose=use_generative_transpose,
+            )
             self.bn = _make_norm(norm, out_ch)
             self.relu = ME.MinkowskiReLU(inplace=True)
             self.res = SparseResBlock(out_ch, out_ch, norm=norm)
@@ -114,12 +153,22 @@ if HAS_MINKOWSKI:
             out_ch: Optional[int] = None,
             n_up: int = 3,
             norm: str = "bn",
+            use_generative_transpose: bool = False,
         ):
             super().__init__()
+            self.use_generative_transpose = bool(use_generative_transpose)
             chs = list(reversed([base_ch * (2 ** i) for i in range(n_up + 1)]))
             self.proj = ME.MinkowskiConvolution(latent_ch, chs[0], kernel_size=1, stride=1, dimension=3)
             self.ups = nn.ModuleList(
-                [SparseUpBlock(chs[i], chs[i + 1], norm=norm) for i in range(n_up)]
+                [
+                    SparseUpBlock(
+                        chs[i],
+                        chs[i + 1],
+                        norm=norm,
+                        use_generative_transpose=self.use_generative_transpose,
+                    )
+                    for i in range(n_up)
+                ]
             )
             self.out_proj = ME.MinkowskiConvolution(chs[-1], out_ch or base_ch, kernel_size=1, stride=1, dimension=3)
             self.pruning = ME.MinkowskiPruning()
@@ -213,8 +262,10 @@ else:
             out_ch: Optional[int] = None,
             n_up: int = 3,
             norm: str = "bn",  # accepted for API parity; dense fallback ignores it
+            use_generative_transpose: bool = False,
         ):
             super().__init__()
+            self.use_generative_transpose = False
             chs = list(reversed([base_ch * (2 ** i) for i in range(n_up + 1)]))
             self.proj = nn.Conv3d(latent_ch, chs[0], 1)
             ups = []

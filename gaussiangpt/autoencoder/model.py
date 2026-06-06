@@ -39,8 +39,10 @@ class GaussianAutoencoder(nn.Module):
         voxel_size: float = 0.025,
         norm: str = "bn",
         color_activation: str = "clamp",
+        use_generative_transpose: bool = False,
     ):
         super().__init__()
+        self.use_generative_transpose = bool(use_generative_transpose)
         num_bits = int(math.log2(codebook_size))
         assert 2 ** num_bits == codebook_size, "codebook_size must be a power of 2"
 
@@ -58,7 +60,12 @@ class GaussianAutoencoder(nn.Module):
             in_ch=in_ch, base_ch=base_ch, latent_ch=num_bits, n_down=n_down, norm=norm,
         )
         self.decoder = SparseDecoder(
-            latent_ch=num_bits, base_ch=base_ch, out_ch=in_ch, n_up=n_down, norm=norm,
+            latent_ch=num_bits,
+            base_ch=base_ch,
+            out_ch=in_ch,
+            n_up=n_down,
+            norm=norm,
+            use_generative_transpose=self.use_generative_transpose,
         )
 
         # LFQ quantizer
@@ -151,13 +158,24 @@ class GaussianAutoencoder(nn.Module):
 
         # Step 4: sparse 3D CNN decoder
         if HAS_MINKOWSKI:
-            # Reuse the sparse structure from encoder output, replace features with z_q
             import MinkowskiEngine as ME
-            z_q_sparse = ME.SparseTensor(
-                features=z_q,
-                coordinate_map_key=z_sparse.coordinate_map_key,
-                coordinate_manager=z_sparse.coordinate_manager,
-            )
+            if self.use_generative_transpose:
+                # Start the decoder from only the bottleneck coordinates. Reusing
+                # the encoder coordinate manager can expose finer coordinate maps
+                # to transpose convolutions, which defeats generative expansion.
+                z_q_sparse = ME.SparseTensor(
+                    features=z_q,
+                    coordinates=z_sparse.C,
+                    tensor_stride=z_sparse.tensor_stride,
+                )
+            else:
+                # Backward-compatible path: reuse the sparse structure from the
+                # encoder output, replacing only features with quantized codes.
+                z_q_sparse = ME.SparseTensor(
+                    features=z_q,
+                    coordinate_map_key=z_sparse.coordinate_map_key,
+                    coordinate_manager=z_sparse.coordinate_manager,
+                )
             decoded_sparse, occ_list = self.decoder(
                 z_q_sparse,
                 prune=prune,

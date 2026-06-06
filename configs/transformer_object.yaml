@@ -6,6 +6,7 @@ autoencoder:
   n_down: 2
   codebook_size: 4096
   use_sh: true
+  use_generative_transpose: false
 
 model:
   size: "small"        # GPT-2 small: 12 layers, 12 heads, 768 embd

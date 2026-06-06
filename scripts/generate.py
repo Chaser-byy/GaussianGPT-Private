@@ -44,6 +44,11 @@ def parse_args():
     parser.add_argument("--chunk_size", type=int, nargs=3, default=[16, 16, 16])
     parser.add_argument("--ae_base_ch", type=int, default=32)
     parser.add_argument("--ae_n_down", type=int, default=3)
+    parser.add_argument(
+        "--ae_use_generative_transpose",
+        action="store_true",
+        help="Build the AE decoder with generative transpose convolutions",
+    )
     parser.add_argument("--gpt_size", type=str, default="medium")
     parser.add_argument("--gpt_context", type=int, default=16384)
     parser.add_argument("--occ_threshold", type=float, default=0.5,
@@ -63,7 +68,12 @@ def load_models(args):
         base_ch=args.ae_base_ch,
         n_down=args.ae_n_down,
         codebook_size=args.codebook_size,
+        use_generative_transpose=bool(args.ae_use_generative_transpose),
     ).to(device)
+    print(
+        "[autoencoder] "
+        f"use_generative_transpose={bool(args.ae_use_generative_transpose)}"
+    )
     # ae_ckpt = torch.load(args.ae_checkpoint, map_location=device)
     # ae.load_state_dict(ae_ckpt["model"] if "model" in ae_ckpt else ae_ckpt)
     ae.eval()

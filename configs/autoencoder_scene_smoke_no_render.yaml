@@ -7,6 +7,7 @@ model:
   n_down: 3              # 3 downsampling stages: 2.5cm -> 5cm -> 10cm -> 20cm
   codebook_size: 16384    # 2^12 = 4096 (12-bit LFQ)
   use_sh: false          # No view-dependent appearance for scenes
+  use_generative_transpose: false  # true lets decoder upsampling generate candidate coords for occupancy/pruning.
   # Note: GaussianGPT Appendix C predicts offsets as unbounded world-space
   # values (no L3DG-style tanh clamping), and scales via softplus.
 
