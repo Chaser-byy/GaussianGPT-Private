@@ -36,25 +36,43 @@ def ase_sparse_collate(batch: List[Dict]) -> Dict:
         target_parts.append(np.asarray(sample["target_feats"], dtype=np.float32))
         metas.append(sample.get("metadata", {}))
 
+    if not coords_list or sum(coords.shape[0] for coords in coords_list) == 0:
+        return {
+            "coords": torch.zeros((0, 4), dtype=torch.long),
+            "feats": torch.zeros((0, 14), dtype=torch.float32),
+            "target_feats": torch.zeros((0, 14), dtype=torch.float32),
+            "metas": metas,
+        }
+
     try:
         import MinkowskiEngine as ME
 
-        coords_tensor = ME.utils.batched_coordinates(coords_list)
+        coords_tensor, feats_tensor = ME.utils.sparse_collate(
+            coords_list,
+            feats_parts,
+            dtype=torch.int32,
+        )
+        target_coords_tensor, target_tensor = ME.utils.sparse_collate(
+            coords_list,
+            target_parts,
+            dtype=torch.int32,
+        )
+        if not torch.equal(coords_tensor, target_coords_tensor):
+            raise RuntimeError("MinkowskiEngine sparse_collate returned mismatched coordinates")
         coords_tensor = coords_tensor.long()
+        feats_tensor = feats_tensor.float()
+        target_tensor = target_tensor.float()
     except ImportError:
         coords_np = _manual_batched_coordinates(coords_list)
         coords_tensor = torch.as_tensor(coords_np, dtype=torch.long)
-
-    if feats_parts:
         feats_np = np.concatenate(feats_parts, axis=0)
         target_np = np.concatenate(target_parts, axis=0)
-    else:
-        feats_np = np.zeros((0, 14), dtype=np.float32)
-        target_np = np.zeros((0, 14), dtype=np.float32)
+        feats_tensor = torch.as_tensor(feats_np, dtype=torch.float32)
+        target_tensor = torch.as_tensor(target_np, dtype=torch.float32)
 
     return {
         "coords": coords_tensor,
-        "feats": torch.as_tensor(feats_np, dtype=torch.float32),
-        "target_feats": torch.as_tensor(target_np, dtype=torch.float32),
+        "feats": feats_tensor,
+        "target_feats": target_tensor,
         "metas": metas,
     }

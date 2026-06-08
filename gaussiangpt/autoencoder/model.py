@@ -98,10 +98,11 @@ class GaussianAutoencoder(nn.Module):
             # Collated ASE batches already include [batch, x, y, z] coordinates.
             return ME.SparseTensor(features=voxel_features, coordinates=voxel_coords.int())
 
-        batch_idx = torch.zeros(
-            voxel_coords.shape[0], 1, dtype=torch.int, device=voxel_coords.device
+        coords_me = ME.utils.batched_coordinates(
+            [voxel_coords],
+            dtype=torch.int32,
+            device=voxel_coords.device,
         )
-        coords_me = torch.cat([batch_idx, voxel_coords.int()], dim=1)
         return ME.SparseTensor(features=voxel_features, coordinates=coords_me)
 
     def forward(

@@ -486,8 +486,11 @@ class TokenizedSceneDataset(Dataset):
 
             if HAS_MINKOWSKI:
                 import MinkowskiEngine as ME
-                batch_idx = torch.zeros(len(voxel_coords_dev), 1, dtype=torch.int, device=self.device)
-                coords_me = torch.cat([batch_idx, voxel_coords_dev.int()], dim=1)
+                coords_me = ME.utils.batched_coordinates(
+                    [voxel_coords_dev],
+                    dtype=torch.int32,
+                    device=voxel_coords_dev.device,
+                )
                 sparse_input = ME.SparseTensor(features=voxel_features, coordinates=coords_me)
                 z_sparse = self.autoencoder.encoder(sparse_input)
                 _, indices, _ = self.autoencoder.quantizer(z_sparse.F)

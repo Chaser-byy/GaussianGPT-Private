@@ -55,27 +55,87 @@ def _log_validation_pruning_counts(
         )
 
 
-def _coord_hash(coords: torch.Tensor) -> torch.Tensor:
-    """Build collision-free integer hashes for a small set of 4D sparse coords."""
-
-    coords = coords.to(torch.long)
-    mins = coords.min(dim=0).values
-    shifted = coords - mins
-    dims = shifted.max(dim=0).values + 1
-    key = shifted[:, 0]
-    for dim in range(1, shifted.shape[1]):
-        key = key * dims[dim] + shifted[:, dim]
-    return key
-
-
 def _as_batched_coords(coords: torch.Tensor, device: torch.device) -> torch.Tensor:
-    coords = coords.to(device=device, dtype=torch.long)
+    coords = coords.to(device=device)
     if coords.dim() == 2 and coords.shape[1] == 3:
-        batch_idx = torch.zeros(
-            coords.shape[0], 1, dtype=torch.long, device=device
+        try:
+            import MinkowskiEngine as ME
+        except ImportError:
+            batch_idx = torch.zeros(
+                coords.shape[0], 1, dtype=torch.long, device=device
+            )
+            return torch.cat([batch_idx, coords.to(dtype=torch.long)], dim=1)
+        return ME.utils.batched_coordinates(
+            [coords.to(dtype=torch.int32)],
+            dtype=torch.int32,
+            device=device,
+        ).to(dtype=torch.long)
+    return coords.to(dtype=torch.long)
+
+
+def _require_minkowski_engine():
+    try:
+        import MinkowskiEngine as ME
+    except ImportError as exc:
+        raise RuntimeError(
+            "Sparse occupancy target alignment requires MinkowskiEngine."
+        ) from exc
+    return ME
+
+
+def _kernel_map_out_indices(mapping, device: torch.device) -> torch.Tensor:
+    """Return output row indices from a MinkowskiEngine kernel map."""
+
+    def _out_from_pair(in_out):
+        if isinstance(in_out, (list, tuple)) and len(in_out) == 2:
+            return in_out[1]
+        if torch.is_tensor(in_out) and in_out.dim() == 2:
+            if in_out.shape[0] == 2:
+                return in_out[1]
+            if in_out.shape[1] == 2:
+                return in_out[:, 1]
+        raise RuntimeError(
+            "Unexpected MinkowskiEngine kernel_map return format while "
+            "aligning sparse occupancy targets."
         )
-        coords = torch.cat([batch_idx, coords], dim=1)
-    return coords
+
+    if isinstance(mapping, dict):
+        pieces = []
+        for in_out in mapping.values():
+            out_indices = _out_from_pair(in_out)
+            if out_indices.numel() > 0:
+                pieces.append(out_indices.to(device=device, dtype=torch.long))
+        if not pieces:
+            return torch.empty(0, dtype=torch.long, device=device)
+        return torch.cat(pieces, dim=0).unique()
+
+    if isinstance(mapping, (list, tuple)) and len(mapping) == 2:
+        out_indices = mapping[1]
+        if torch.is_tensor(out_indices):
+            return out_indices.to(device=device, dtype=torch.long)
+
+    raise RuntimeError(
+        "Unexpected MinkowskiEngine kernel_map return format while aligning "
+        "sparse occupancy targets."
+    )
+
+
+def _coordinate_map_out_indices(
+    coord_manager,
+    in_key,
+    out_key,
+    device: torch.device,
+) -> torch.Tensor:
+    kernel_map = getattr(coord_manager, "kernel_map", None)
+    if kernel_map is None:
+        kernel_map = getattr(coord_manager, "get_kernel_map", None)
+    if kernel_map is None:
+        raise RuntimeError(
+            "Sparse occupancy target alignment requires "
+            "MinkowskiEngine CoordinateManager.kernel_map."
+        )
+    mapping = kernel_map(in_key, out_key, stride=1, kernel_size=1, dilation=1)
+    return _kernel_map_out_indices(mapping, device)
 
 
 def _sparse_occupancy_targets(
@@ -94,7 +154,6 @@ def _sparse_occupancy_targets(
     The returned target has exactly one value per occupancy logit.
     """
 
-    occ_coords = occ.C.to(device=device, dtype=torch.long)
     occ_logits = occ.F.squeeze(-1)
     tensor_stride = getattr(occ, "tensor_stride", None)
     if tensor_stride is None:
@@ -108,17 +167,41 @@ def _sparse_occupancy_targets(
     if occ_logits.numel() == 0:
         return occ_logits, torch.empty_like(occ_logits), stride
 
+    _require_minkowski_engine()
+
     gt_stage_coords = _as_batched_coords(gt_coords, device).clone()
     gt_stage_coords[:, 1:] = torch.div(
         gt_stage_coords[:, 1:], stride, rounding_mode="floor"
     )
-    gt_stage_coords = torch.unique(gt_stage_coords, dim=0)
+    targets = torch.zeros_like(occ_logits)
+    if gt_stage_coords.numel() == 0:
+        return occ_logits, targets, stride
 
-    all_coords = torch.cat([occ_coords, gt_stage_coords], dim=0)
-    all_hash = _coord_hash(all_coords)
-    occ_hash = all_hash[: occ_coords.shape[0]]
-    gt_hash = torch.unique(all_hash[occ_coords.shape[0]:])
-    targets = torch.isin(occ_hash, gt_hash).to(dtype=occ_logits.dtype)
+    coord_manager = getattr(occ, "coordinate_manager", None)
+    if coord_manager is None or getattr(occ, "coordinate_map_key", None) is None:
+        raise RuntimeError(
+            "Sparse occupancy target alignment requires MinkowskiEngine "
+            "SparseTensor coordinate manager state."
+        )
+
+    tensor_stride = [stride] * (gt_stage_coords.shape[1] - 1)
+    # Let ME's CoordinateManager own deduplication and coordinate hashing.
+    gt_key, (unique_map, _) = coord_manager.insert_and_map(
+        gt_stage_coords.to(dtype=torch.int32),
+        tensor_stride,
+        f"gt_occ_targets_s{stage_idx}_{id(occ)}_{id(gt_stage_coords)}",
+    )
+    if unique_map.numel() == 0:
+        return occ_logits, targets, stride
+
+    occ_indices = _coordinate_map_out_indices(
+        coord_manager,
+        gt_key,
+        occ.coordinate_map_key,
+        device,
+    )
+    if occ_indices.numel() > 0:
+        targets[occ_indices.to(device=device, dtype=torch.long)] = 1
     return occ_logits, targets, stride
 
 

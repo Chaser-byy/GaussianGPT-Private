@@ -37,6 +37,8 @@ def _import_minkowski_engine():
 
 
 def _extract_sparse_quantize_result(result, shuffled_coords: np.ndarray) -> tuple:
+    """Normalize legacy sparse_quantize return values to (coords, unique_map)."""
+
     if isinstance(result, tuple):
         index = None
         coords = None
@@ -58,6 +60,26 @@ def _extract_sparse_quantize_result(result, shuffled_coords: np.ndarray) -> tupl
     return shuffled_coords[index], index
 
 
+def _sparse_quantize_unique_coords_and_map(ME, shuffled_coords: np.ndarray) -> tuple:
+    """Return unique coordinates and their input-row map using ME quantization."""
+
+    try:
+        result = ME.utils.sparse_quantize(
+            shuffled_coords,
+            return_index=True,
+            return_maps_only=True,
+        )
+    except TypeError:
+        result = ME.utils.sparse_quantize(shuffled_coords, return_index=True)
+        return _extract_sparse_quantize_result(result, shuffled_coords)
+
+    unique_map = result[0] if isinstance(result, tuple) else result
+    unique_map = np.asarray(unique_map, dtype=np.int64)
+    if unique_map.ndim != 1:
+        raise ValueError("MinkowskiEngine sparse_quantize unique map is not 1D")
+    return shuffled_coords[unique_map], unique_map
+
+
 def quantize_scene_with_minkowski(
     scene: GaussianScene,
     voxel_size: float = 0.025,
@@ -75,9 +97,8 @@ def quantize_scene_with_minkowski(
     shuffled_original_indices = rng.permutation(scene.xyz.shape[0]).astype(np.int64)
     shuffled_coords = scene_coords_all[shuffled_original_indices]
 
-    result = ME.utils.sparse_quantize(shuffled_coords, return_index=True)
-    quantized_coords, selected_shuffled_indices = _extract_sparse_quantize_result(
-        result, shuffled_coords
+    quantized_coords, selected_shuffled_indices = _sparse_quantize_unique_coords_and_map(
+        ME, shuffled_coords
     )
     selected_indices = shuffled_original_indices[selected_shuffled_indices].astype(np.int64)
 

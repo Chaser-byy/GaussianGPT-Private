@@ -60,7 +60,7 @@ loss:
 
 validation:
   prune: false
-  prune_with_gt_logits: true
+  prune_with_gt_logits: false
   occ_threshold: 0.5
   prune_min_keep: 1
 
@@ -77,7 +77,7 @@ camera_sampling:
   log_every: 100
 
 training:
-  train_prune_with_gt_logits: true  # Training decoder prune uses GT occupancy targets, not occ-head logits.
+  train_prune_with_gt_logits: false  # Training decoder prune uses GT occupancy targets, not occ-head logits.
   epochs: 6000
   batch_size: 1
   lr: 1.0e-4
@@ -89,8 +89,8 @@ diagnostics:
   color_check_every: 100
 
 debug:
-  norm: "instance"
-  color_activation: "sigmoid"
+  norm: "bn"
+  color_activation: "clamp"
 
   # Reuse the same chunk.
   fixed_chunk: true

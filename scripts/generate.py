@@ -121,8 +121,11 @@ def decode_tokens_to_gaussians(
     from gaussiangpt.autoencoder.sparse_cnn import HAS_MINKOWSKI
     if HAS_MINKOWSKI:
         import MinkowskiEngine as ME
-        batch_idx = torch.zeros(len(voxel_coords), 1, dtype=torch.int, device=device)
-        coords_me = torch.cat([batch_idx, voxel_coords.to(device)], dim=1)
+        coords_me = ME.utils.batched_coordinates(
+            [voxel_coords.to(device)],
+            dtype=torch.int32,
+            device=device,
+        )
         latent_stride = 2**ae.n_down   # 8 = 2 ** 3暂时写死, 后面可以改
         sparse_input = ME.SparseTensor(features=z_q, coordinates=coords_me, tensor_stride=latent_stride)
         decoded, _ = ae.decoder(
