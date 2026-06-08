@@ -16,6 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
 
+STRIDE2_KERNEL_SIZE = 3
+
 try:
     import MinkowskiEngine as ME
     HAS_MINKOWSKI = True
@@ -55,7 +57,13 @@ if HAS_MINKOWSKI:
                 )
         else:
             conv_cls = ME.MinkowskiConvolutionTranspose
-        return conv_cls(in_ch, out_ch, kernel_size=2, stride=2, dimension=3)
+        return conv_cls(
+            in_ch,
+            out_ch,
+            kernel_size=STRIDE2_KERNEL_SIZE,
+            stride=2,
+            dimension=3,
+        )
 
     class SparseResBlock(nn.Module):
         def __init__(self, in_ch: int, out_ch: int, norm: str = "bn"):
@@ -79,7 +87,13 @@ if HAS_MINKOWSKI:
     class SparseDownBlock(nn.Module):
         def __init__(self, in_ch: int, out_ch: int, norm: str = "bn"):
             super().__init__()
-            self.conv = ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=2, stride=2, dimension=3)
+            self.conv = ME.MinkowskiConvolution(
+                in_ch,
+                out_ch,
+                kernel_size=STRIDE2_KERNEL_SIZE,
+                stride=2,
+                dimension=3,
+            )
             self.bn = _make_norm(norm, out_ch)
             self.relu = ME.MinkowskiReLU(inplace=True)
             self.res = SparseResBlock(out_ch, out_ch, norm=norm)
@@ -234,7 +248,14 @@ else:
             ]
             for i in range(n_down):
                 layers += [
-                    nn.Conv3d(chs[i], chs[i + 1], 2, stride=2), nn.ReLU(inplace=True),
+                    nn.Conv3d(
+                        chs[i],
+                        chs[i + 1],
+                        STRIDE2_KERNEL_SIZE,
+                        stride=2,
+                        padding=STRIDE2_KERNEL_SIZE // 2,
+                    ),
+                    nn.ReLU(inplace=True),
                     DenseResBlock(chs[i + 1]),
                 ]
             layers.append(nn.Conv3d(chs[-1], latent_ch, 1))
@@ -259,7 +280,14 @@ else:
             ups = []
             for i in range(n_up):
                 ups += [
-                    nn.ConvTranspose3d(chs[i], chs[i + 1], 2, stride=2),
+                    nn.ConvTranspose3d(
+                        chs[i],
+                        chs[i + 1],
+                        STRIDE2_KERNEL_SIZE,
+                        stride=2,
+                        padding=STRIDE2_KERNEL_SIZE // 2,
+                        output_padding=1,
+                    ),
                     nn.ReLU(inplace=True),
                     DenseResBlock(chs[i + 1]),
                 ]
