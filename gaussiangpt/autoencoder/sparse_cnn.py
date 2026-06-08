@@ -13,7 +13,6 @@ convolution. The default remains the existing ``MinkowskiConvolutionTranspose``.
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import List, Optional
 
 STRIDE2_KERNEL_SIZE = 3
@@ -65,6 +64,29 @@ if HAS_MINKOWSKI:
             dimension=3,
         )
 
+    def _make_conv_block(in_ch: int, out_ch: int, stride: int, norm: str) -> nn.Module:
+        return nn.Sequential(
+            ME.MinkowskiConvolution(in_ch, out_ch, kernel_size=3, stride=stride, dimension=3),
+            _make_norm(norm, out_ch),
+            ME.MinkowskiReLU(inplace=True),
+        )
+
+    def _make_transpose_conv_block(
+        in_ch: int,
+        out_ch: int,
+        norm: str,
+        use_generative_transpose: bool = False,
+    ) -> nn.Module:
+        return nn.Sequential(
+            _make_transpose_conv(
+                in_ch,
+                out_ch,
+                use_generative_transpose=use_generative_transpose,
+            ),
+            _make_norm(norm, out_ch),
+            ME.MinkowskiReLU(inplace=True),
+        )
+
     class SparseResBlock(nn.Module):
         def __init__(self, in_ch: int, out_ch: int, norm: str = "bn"):
             super().__init__()
@@ -87,19 +109,14 @@ if HAS_MINKOWSKI:
     class SparseDownBlock(nn.Module):
         def __init__(self, in_ch: int, out_ch: int, norm: str = "bn"):
             super().__init__()
-            self.conv = ME.MinkowskiConvolution(
-                in_ch,
-                out_ch,
-                kernel_size=STRIDE2_KERNEL_SIZE,
-                stride=2,
-                dimension=3,
-            )
-            self.bn = _make_norm(norm, out_ch)
-            self.relu = ME.MinkowskiReLU(inplace=True)
-            self.res = SparseResBlock(out_ch, out_ch, norm=norm)
+            self.conv = _make_conv_block(out_ch, out_ch, stride=2, norm=norm)
+            self.res1 = SparseResBlock(in_ch, out_ch, norm=norm)
+            self.res2 = SparseResBlock(out_ch, out_ch, norm=norm)
 
         def forward(self, x):
-            return self.res(self.relu(self.bn(self.conv(x))))
+            x = self.res1(x)
+            x = self.res2(x)
+            return self.conv(x)
 
     class SparseUpBlock(nn.Module):
         def __init__(
@@ -110,18 +127,20 @@ if HAS_MINKOWSKI:
             use_generative_transpose: bool = False,
         ):
             super().__init__()
-            self.conv = _make_transpose_conv(
-                in_ch,
+            self.res1 = SparseResBlock(in_ch, out_ch, norm=norm)
+            self.res2 = SparseResBlock(out_ch, out_ch, norm=norm)
+            self.transpose = _make_transpose_conv_block(
                 out_ch,
+                out_ch,
+                norm=norm,
                 use_generative_transpose=use_generative_transpose,
             )
-            self.bn = _make_norm(norm, out_ch)
-            self.relu = ME.MinkowskiReLU(inplace=True)
-            self.res = SparseResBlock(out_ch, out_ch, norm=norm)
             self.occ_head = ME.MinkowskiLinear(out_ch, 1)
 
         def forward(self, x):
-            x = self.res(self.relu(self.bn(self.conv(x))))
+            x = self.res1(x)
+            x = self.res2(x)
+            x = self.transpose(x)
             return x, self.occ_head(x)
 
     class SparseEncoder(nn.Module):
@@ -134,19 +153,20 @@ if HAS_MINKOWSKI:
             norm: str = "bn",
         ):
             super().__init__()
-            self.stem = ME.MinkowskiConvolution(in_ch, base_ch, kernel_size=3, stride=1, dimension=3)
-            self.stem_bn = _make_norm(norm, base_ch)
-            self.stem_relu = ME.MinkowskiReLU(inplace=True)
+            self.conv1 = _make_conv_block(in_ch, base_ch, stride=1, norm=norm)
+
             chs = [base_ch * (2 ** i) for i in range(n_down + 1)]
             self.downs = nn.ModuleList(
                 [SparseDownBlock(chs[i], chs[i + 1], norm=norm) for i in range(n_down)]
             )
             self.proj = ME.MinkowskiConvolution(chs[-1], latent_ch, kernel_size=1, stride=1, dimension=3)
+            self.res = SparseResBlock(chs[-1], chs[-1], norm=norm)
 
         def forward(self, x):
-            x = self.stem_relu(self.stem_bn(self.stem(x)))
+            x = self.conv1(x)
             for d in self.downs:
                 x = d(x)
+            x = self.res(x)
             return self.proj(x)
 
     class SparseDecoder(nn.Module):
@@ -154,14 +174,14 @@ if HAS_MINKOWSKI:
             self,
             latent_ch: int,
             base_ch: int = 128,
-            out_ch: Optional[int] = None,
+            out_ch: int = 224,
             n_up: int = 3,
             norm: str = "bn",
             use_generative_transpose: bool = False,
         ):
             super().__init__()
             chs = list(reversed([base_ch * (2 ** i) for i in range(n_up + 1)]))
-            self.proj = ME.MinkowskiConvolution(latent_ch, chs[0], kernel_size=1, stride=1, dimension=3)
+            self.conv1 = _make_conv_block(latent_ch, chs[0], stride=1, norm=norm)
             self.ups = nn.ModuleList(
                 [
                     SparseUpBlock(
@@ -173,7 +193,9 @@ if HAS_MINKOWSKI:
                     for i in range(n_up)
                 ]
             )
-            self.out_proj = ME.MinkowskiConvolution(chs[-1], out_ch or base_ch, kernel_size=1, stride=1, dimension=3)
+            self.res1 = SparseResBlock(chs[-1], chs[-1], norm=norm)
+            self.res2 = SparseResBlock(chs[-1], chs[-1], norm=norm)
+            self.out_proj = ME.MinkowskiConvolution(chs[-1], out_ch, kernel_size=1, stride=1, dimension=3)
             self.pruning = ME.MinkowskiPruning()
 
         @staticmethod
@@ -195,7 +217,7 @@ if HAS_MINKOWSKI:
             min_keep: int = 1,
             prune_mask_fn=None,
         ):
-            x = self.proj(x)
+            x = self.conv1(x)
             occ_list = []
             for stage_idx, u in enumerate(self.ups):
                 x, occ = u(x)
@@ -215,6 +237,8 @@ if HAS_MINKOWSKI:
                             f"{occ.F.shape[0]} sparse voxels at stage {stage_idx}."
                         )
                     x = self.pruning(x, keep)
+            x = self.res1(x)
+            x = self.res2(x)
             return self.out_proj(x), occ_list
 
 else:
