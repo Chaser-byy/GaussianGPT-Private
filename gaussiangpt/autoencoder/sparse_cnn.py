@@ -17,6 +17,44 @@ from typing import List, Optional
 
 STRIDE2_KERNEL_SIZE = 3
 
+
+def _tensor_stride_int(tensor) -> int:
+    tensor_stride = getattr(tensor, "tensor_stride", 1)
+    if isinstance(tensor_stride, (list, tuple)):
+        return max(int(tensor_stride[0]), 1)
+    return max(int(tensor_stride), 1)
+
+
+def _kernel_map_input_indices(mapping, device: torch.device) -> torch.Tensor:
+    """Return input row indices from a MinkowskiEngine kernel map."""
+
+    def _input_from_pair(in_out):
+        if isinstance(in_out, (list, tuple)) and len(in_out) == 2:
+            return in_out[0]
+        if torch.is_tensor(in_out) and in_out.dim() == 2:
+            if in_out.shape[0] == 2:
+                return in_out[0]
+            if in_out.shape[1] == 2:
+                return in_out[:, 0]
+        raise RuntimeError("Unexpected MinkowskiEngine kernel_map return format.")
+
+    if isinstance(mapping, dict):
+        pieces = []
+        for in_out in mapping.values():
+            input_indices = _input_from_pair(in_out)
+            if input_indices.numel() > 0:
+                pieces.append(input_indices.to(device=device, dtype=torch.long))
+        if not pieces:
+            return torch.empty(0, dtype=torch.long, device=device)
+        return torch.cat(pieces, dim=0)
+
+    if isinstance(mapping, (list, tuple)) and len(mapping) == 2:
+        input_indices = mapping[0]
+        if torch.is_tensor(input_indices):
+            return input_indices.to(device=device, dtype=torch.long)
+
+    raise RuntimeError("Unexpected MinkowskiEngine kernel_map return format.")
+
 try:
     import MinkowskiEngine as ME
     HAS_MINKOWSKI = True
@@ -161,11 +199,18 @@ if HAS_MINKOWSKI:
             )
             self.proj = ME.MinkowskiConvolution(chs[-1], latent_ch, kernel_size=1, stride=1, dimension=3)
             self.res = SparseResBlock(chs[-1], chs[-1], norm=norm)
+            self.encoder_target_keys = {}
+
+        def _cache_target_key(self, x) -> None:
+            self.encoder_target_keys[_tensor_stride_int(x)] = x.coordinate_map_key
 
         def forward(self, x):
+            self.encoder_target_keys = {}
             x = self.conv1(x)
+            self._cache_target_key(x)
             for d in self.downs:
                 x = d(x)
+                self._cache_target_key(x)
             x = self.res(x)
             return self.proj(x)
 
@@ -209,6 +254,64 @@ if HAS_MINKOWSKI:
                 keep[idx] = True
             return keep
 
+        @staticmethod
+        def _encoder_target_keep_mask(occ, encoder_target_keys: dict) -> tuple:
+            occ_logits = occ.F.squeeze(-1)
+            stride = _tensor_stride_int(occ)
+            targets = torch.zeros_like(occ_logits)
+            keep = torch.zeros(
+                occ.F.shape[0],
+                dtype=torch.bool,
+                device=occ.F.device,
+            )
+
+            target_key = encoder_target_keys.get(stride)
+            if target_key is None:
+                available = sorted(int(k) for k in encoder_target_keys.keys())
+                raise KeyError(
+                    "Missing encoder target coordinate_map_key for decoder "
+                    f"stride {stride}; available strides: {available}."
+                )
+
+            coord_manager = getattr(occ, "coordinate_manager", None)
+            if coord_manager is None or getattr(occ, "coordinate_map_key", None) is None:
+                raise RuntimeError(
+                    "GT decoder pruning requires SparseTensor coordinate manager state."
+                )
+
+            mapping = coord_manager.kernel_map(
+                occ.coordinate_map_key,
+                target_key,
+                kernel_size=1,
+                stride=1,
+                dilation=1,
+            )
+            occ_indices = _kernel_map_input_indices(mapping, occ.F.device)
+            if occ_indices.numel() > 0:
+                if (
+                    int(occ_indices.min().item()) < 0
+                    or int(occ_indices.max().item()) >= occ.F.shape[0]
+                ):
+                    raise RuntimeError(
+                        "MinkowskiEngine kernel_map returned out-of-range "
+                        "decoder occupancy indices."
+                    )
+                keep[occ_indices] = True
+                targets[occ_indices] = 1
+
+            if keep.numel() != occ.F.shape[0]:
+                raise ValueError(
+                    "Decoder GT prune mask length must match stage occupancy "
+                    f"logits: got {keep.numel()} mask values for "
+                    f"{occ.F.shape[0]} sparse voxels."
+                )
+            if targets.numel() != occ_logits.numel():
+                raise ValueError(
+                    "Decoder occupancy targets length must match occupancy logits: "
+                    f"got {targets.numel()} targets for {occ_logits.numel()} logits."
+                )
+            return keep, occ_logits, targets, stride
+
         def forward(
             self,
             x,
@@ -216,14 +319,31 @@ if HAS_MINKOWSKI:
             occupancy_threshold: float = 0.5,
             min_keep: int = 1,
             prune_mask_fn=None,
+            encoder_target_keys: Optional[dict] = None,
+            prune_with_encoder_targets: bool = False,
+            occ_target_cache: Optional[dict] = None,
         ):
             x = self.conv1(x)
             occ_list = []
             for stage_idx, u in enumerate(self.ups):
                 x, occ = u(x)
                 occ_list.append(occ)
+                encoder_keep = None
+                if encoder_target_keys is not None:
+                    encoder_keep, occ_logits, targets, stride = self._encoder_target_keep_mask(
+                        occ,
+                        encoder_target_keys,
+                    )
+                    if occ_target_cache is not None:
+                        occ_target_cache[stage_idx] = (occ_logits, targets, stride)
                 if prune:
-                    if prune_mask_fn is None:
+                    if prune_with_encoder_targets:
+                        if encoder_keep is None:
+                            raise RuntimeError(
+                                "GT decoder pruning requires encoder target keys."
+                            )
+                        keep = encoder_keep
+                    elif prune_mask_fn is None:
                         keep = self._occupancy_keep_mask(
                             occ, occupancy_threshold, min_keep
                         )

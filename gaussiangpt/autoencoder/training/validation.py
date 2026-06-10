@@ -11,6 +11,7 @@ from plyfile import PlyData, PlyElement
 from gaussiangpt.autoencoder.training.config import (
     camera_sampling_config,
     effective_render_view_count,
+    training_pruning_config,
     validation_pruning_config,
 )
 from gaussiangpt.autoencoder.training.gaussian_features import (
@@ -18,7 +19,6 @@ from gaussiangpt.autoencoder.training.gaussian_features import (
     build_world_positions,
 )
 from gaussiangpt.autoencoder.training.losses import compute_batch_loss
-from gaussiangpt.autoencoder.training.losses import make_gt_prune_mask_fn
 from gaussiangpt.autoencoder.training.render_losses import (
     HAS_RASTERIZER,
     render_gaussians,
@@ -150,11 +150,6 @@ def save_validation_reconstruction(
     voxel_coords = sample["voxel_coords"].to(device)
     gaussians = {k: v.to(device) for k, v in sample.items()
                  if k in ("offset", "scale", "opacity", "rotation", "color", "sh")}
-    prune_mask_fn = None
-    if gt_prune_with_gt_logits:
-        prune_mask_fn, _occ_target_cache, _gt_prune_debug = make_gt_prune_mask_fn(
-            voxel_coords, device
-        )
     decoder_prune = bool(prune or gt_prune_with_gt_logits)
 
     pred_gaussians, _, _, _ = raw_model(
@@ -163,7 +158,7 @@ def save_validation_reconstruction(
         prune=decoder_prune,
         occupancy_threshold=occupancy_threshold,
         min_keep=prune_min_keep,
-        prune_mask_fn=prune_mask_fn,
+        prune_with_encoder_targets=gt_prune_with_gt_logits,
     )
     pred_coords = pred_gaussians.pop("_coords", None)
     if pred_coords is not None:
@@ -271,8 +266,10 @@ def validate(
     total_loss = total_occ = total_lfq = 0.0
     total_rgb = total_perc = 0.0
     val_prune_cfg = validation_pruning_config(cfg)
+    train_prune_cfg = training_pruning_config(cfg)
     val_prune = bool(val_prune_cfg["prune"])
-    val_gt_prune = bool(val_prune_cfg["prune_with_gt_logits"])
+    train_gt_prune = bool(train_prune_cfg["train_prune_with_gt_logits"])
+    val_gt_prune = bool(val_prune_cfg["prune_with_gt_logits"] or train_gt_prune)
     val_occ_threshold = float(val_prune_cfg["occ_threshold"])
     val_prune_min_keep = int(val_prune_cfg["prune_min_keep"])
     val_decoder_prune = bool(val_prune or val_gt_prune)

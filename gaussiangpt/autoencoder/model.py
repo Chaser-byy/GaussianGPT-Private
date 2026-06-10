@@ -2,7 +2,7 @@
 import math
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .gaussian_heads import GaussianAttributeEncoder, GaussianAttributeDecoder
 from .sparse_cnn import SparseEncoder, SparseDecoder, HAS_MINKOWSKI
@@ -113,6 +113,8 @@ class GaussianAutoencoder(nn.Module):
         occupancy_threshold: float = 0.5,
         min_keep: int = 1,
         prune_mask_fn=None,
+        prune_with_encoder_targets: bool = False,
+        occ_target_cache: Optional[dict] = None,
     ) -> Tuple[Dict[str, torch.Tensor], List, torch.Tensor, torch.Tensor]:
         """
         Full forward pass for training.
@@ -125,6 +127,10 @@ class GaussianAutoencoder(nn.Module):
             min_keep: minimum voxels to keep at each decoder pruning stage
             prune_mask_fn: optional callable returning an external keep mask per
                 decoder stage; when omitted, pruning uses occ-head logits
+            prune_with_encoder_targets: use encoder coordinate_map_key targets
+                for decoder pruning instead of occ-head logits
+            occ_target_cache: optional dict populated with per-stage
+                (occ_logits, targets, stride) tuples for L_occ
         Returns:
             pred_gaussians: dict of reconstructed Gaussian attributes
             occ_logits_list: list of occupancy logits per decoder upsampling stage
@@ -139,6 +145,9 @@ class GaussianAutoencoder(nn.Module):
             sparse_in = self._make_sparse_tensor(voxel_features, voxel_coords)
             z_sparse = self.encoder(sparse_in)
             z = z_sparse.F  # (N_latent, num_bits)
+            encoder_target_keys = None
+            if prune_with_encoder_targets or occ_target_cache is not None:
+                encoder_target_keys = dict(self.encoder.encoder_target_keys)
         else:
             # Dense fallback: place features in a (1, C, X, Y, Z) grid
             max_coord = voxel_coords.max(0).values  # (3,)
@@ -173,6 +182,9 @@ class GaussianAutoencoder(nn.Module):
                 occupancy_threshold=occupancy_threshold,
                 min_keep=min_keep,
                 prune_mask_fn=prune_mask_fn,
+                encoder_target_keys=encoder_target_keys,
+                prune_with_encoder_targets=prune_with_encoder_targets,
+                occ_target_cache=occ_target_cache,
             )
             decoded_feat = decoded_sparse.F  # (N_latent, in_ch)
             decoded_coords = decoded_sparse.C.long()
