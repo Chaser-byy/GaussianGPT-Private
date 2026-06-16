@@ -44,6 +44,7 @@ camera_sampling:
   mode: "scoring"
 
 training:
+  generative_train_prune_with_gt: true  # Only used when model.use_generative_transpose is true.
   epochs: 6000
   batch_size: 1
   lr: 1.0e-4

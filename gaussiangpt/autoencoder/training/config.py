@@ -155,6 +155,11 @@ def model_use_generative_transpose(cfg: dict) -> bool:
     return bool(model_cfg.get("use_generative_transpose", False))
 
 
+def generative_train_prune_with_gt(cfg: dict) -> bool:
+    training_cfg = cfg.get("training", {}) or {}
+    return bool(training_cfg.get("generative_train_prune_with_gt", True))
+
+
 def validation_pruning_config(cfg: dict) -> dict:
     validation_cfg = cfg.get("validation", {}) or {}
     return {

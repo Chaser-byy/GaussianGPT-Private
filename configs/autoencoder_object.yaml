@@ -37,6 +37,7 @@ validation:
   prune_min_keep: 1
 
 training:
+  generative_train_prune_with_gt: true  # Only used when model.use_generative_transpose is true.
   epochs: 100
   batch_size: 24
   lr: 1.0e-4

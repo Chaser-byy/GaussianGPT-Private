@@ -25,6 +25,7 @@ from gaussiangpt.autoencoder.diagnostics import ColorClampDiagnostics
 from gaussiangpt.autoencoder.training.config import (
     DebugOptions,
     debug_options,
+    generative_train_prune_with_gt,
     load_config,
     log_debug_options,
     model_use_generative_transpose,
@@ -70,6 +71,7 @@ def build_model(
         norm=debug.norm_kind,
         color_activation=debug.color_act,
         use_generative_transpose=model_use_generative_transpose(cfg),
+        generative_train_prune_with_gt=generative_train_prune_with_gt(cfg),
     ).to(device)
 
     if n_gpus > 1:
@@ -120,11 +122,21 @@ def train(cfg: dict, args):
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
     global_step = 0
     train_auto_prune = model_use_generative_transpose(cfg)
+    train_auto_prune_with_gt = generative_train_prune_with_gt(cfg)
+    if train_auto_prune:
+        train_prune_source = (
+            "occ_head_or_gt_target"
+            if train_auto_prune_with_gt
+            else "occ_head_only"
+        )
+    else:
+        train_prune_source = "disabled"
     print(
         "[training pruning] "
         f"generative_transpose={train_auto_prune} "
         f"auto_prune={train_auto_prune} "
-        f"source={'occ_logits_or_gt_targets' if train_auto_prune else 'disabled'}"
+        f"generative_train_prune_with_gt={train_auto_prune_with_gt} "
+        f"source={train_prune_source}"
     )
 
     # ---- Per-head decoder diagnostics ----

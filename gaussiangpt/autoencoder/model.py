@@ -39,6 +39,7 @@ class GaussianAutoencoder(nn.Module):
         norm: str = "bn",
         color_activation: str = "clamp",
         use_generative_transpose: bool = False,
+        generative_train_prune_with_gt: bool = True,
     ):
         super().__init__()
         num_bits = int(math.log2(codebook_size))
@@ -64,6 +65,7 @@ class GaussianAutoencoder(nn.Module):
             n_up=n_down,
             norm=norm,
             use_generative_transpose=use_generative_transpose,
+            generative_train_prune_with_gt=generative_train_prune_with_gt,
         )
 
         # LFQ quantizer
@@ -71,6 +73,7 @@ class GaussianAutoencoder(nn.Module):
         self.n_down = n_down
         self.voxel_size = float(voxel_size)
         self.use_generative_transpose = bool(use_generative_transpose)
+        self.generative_train_prune_with_gt = bool(generative_train_prune_with_gt)
 
         # Gaussian attribute decoder. Per GaussianGPT Appendix C, offsets
         # are predicted as unbounded world-space values (no offset_bound).

@@ -216,6 +216,7 @@ if HAS_MINKOWSKI:
             n_up: int = 3,
             norm: str = "bn",
             use_generative_transpose: bool = False,
+            generative_train_prune_with_gt: bool = True,
         ):
             super().__init__()
             chs = list(reversed([base_ch * (2 ** i) for i in range(n_up + 1)]))
@@ -236,6 +237,7 @@ if HAS_MINKOWSKI:
             self.out_proj = ME.MinkowskiConvolution(chs[-1], out_ch, kernel_size=1, stride=1, dimension=3)
             self.pruning = ME.MinkowskiPruning()
             self.use_generative_transpose = bool(use_generative_transpose)
+            self.generative_train_prune_with_gt = bool(generative_train_prune_with_gt)
 
         @staticmethod
         def _occupancy_keep_mask(occ, threshold: float, min_keep: int) -> torch.Tensor:
@@ -251,12 +253,18 @@ if HAS_MINKOWSKI:
         @staticmethod
         def _generative_training_keep_mask(
             occ_logits: torch.Tensor,
-            target: torch.Tensor,
+            target: Optional[torch.Tensor] = None,
+            use_gt: bool = True,
         ) -> torch.Tensor:
-            return (occ_logits > 0) | target.to(
-                device=occ_logits.device,
-                dtype=torch.bool,
-            )
+            occ_keep = occ_logits > 0
+            if not use_gt:
+                return occ_keep
+            if target is None:
+                raise RuntimeError(
+                    "GenerativeTranspose GT-forced training pruning requires "
+                    "GT occupancy targets."
+                )
+            return occ_keep | target.to(device=occ_logits.device, dtype=torch.bool)
 
         @torch.no_grad()
         def get_target(self, out, target_key, kernel_size: int = 1) -> torch.Tensor:
@@ -342,7 +350,10 @@ if HAS_MINKOWSKI:
                 need_gt_target = bool(
                     occ_target_cache is not None
                     or gt_prune
-                    or auto_generative_prune
+                    or (
+                        auto_generative_prune
+                        and self.generative_train_prune_with_gt
+                    )
                 )
                 if need_gt_target:
                     target, occ_logits, targets, stride = self._target_keep_mask(
@@ -353,7 +364,11 @@ if HAS_MINKOWSKI:
                         occ_target_cache[stage_idx] = (occ_logits, targets, stride)
                 keep = None
                 if auto_generative_prune:
-                    keep = self._generative_training_keep_mask(occ_logits, target)
+                    keep = self._generative_training_keep_mask(
+                        occ_logits,
+                        target,
+                        use_gt=self.generative_train_prune_with_gt,
+                    )
                 else:
                     if gt_prune:
                         if target is None:
@@ -439,6 +454,7 @@ else:
             n_up: int = 3,
             norm: str = "bn",  # accepted for API parity; dense fallback ignores it
             use_generative_transpose: bool = False,  # accepted for API parity; dense fallback ignores it
+            generative_train_prune_with_gt: bool = True,  # API parity; dense fallback ignores it
         ):
             super().__init__()
             chs = list(reversed([base_ch * (2 ** i) for i in range(n_up + 1)]))
