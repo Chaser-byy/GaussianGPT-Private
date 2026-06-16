@@ -157,37 +157,11 @@ def model_use_generative_transpose(cfg: dict) -> bool:
 
 def validation_pruning_config(cfg: dict) -> dict:
     validation_cfg = cfg.get("validation", {}) or {}
-    occ_threshold = validation_cfg.get(
-        "occ_threshold",
-        validation_cfg.get("occupancy_threshold", 0.5),
-    )
-    prune_min_keep = validation_cfg.get(
-        "prune_min_keep",
-        validation_cfg.get("min_keep", 1),
-    )
     return {
-        "prune": bool(validation_cfg.get("prune", False)),
-        "prune_with_gt_logits": bool(
-            validation_cfg.get("prune_with_gt_logits", False)
-        ),
-        "occ_threshold": float(occ_threshold),
-        "prune_min_keep": int(prune_min_keep),
-    }
-
-
-def training_pruning_config(cfg: dict) -> dict:
-    """Return decoder pruning switches for the training forward path."""
-
-    training_cfg = cfg.get("training", {}) or {}
-    prune_min_keep = training_cfg.get(
-        "train_prune_min_keep",
-        training_cfg.get("prune_min_keep", 0),
-    )
-    return {
-        "train_prune_with_gt_logits": bool(
-            training_cfg.get("train_prune_with_gt_logits", False)
-        ),
-        "train_prune_min_keep": int(prune_min_keep),
+        "gt_prune": bool(validation_cfg.get("gt_prune", False)),
+        "occ_head_prune": bool(validation_cfg.get("occ_head_prune", False)),
+        "occ_threshold": float(validation_cfg.get("occ_threshold", 0.5)),
+        "prune_min_keep": int(validation_cfg.get("prune_min_keep", 1)),
     }
 
 

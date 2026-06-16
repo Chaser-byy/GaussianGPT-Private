@@ -87,13 +87,12 @@ def compute_batch_loss(
     rng: torch.Generator = None,
     gt_render_cache: Optional[dict] = None,
     global_step: Optional[int] = None,
-    decoder_prune: bool = False,
+    gt_prune: bool = False,
+    occ_head_prune: bool = False,
     occupancy_threshold: float = 0.5,
     prune_min_keep: int = 1,
     log_pruning: bool = False,
     log_prefix: str = "validation",
-    train_prune_with_gt_logits: bool = False,
-    gt_prune_with_gt_logits: bool = False,
 ):
     """Compute one loss step for an ASE batch collated by ase_sparse_collate."""
 
@@ -112,7 +111,8 @@ def compute_batch_loss(
 
     gaussians = gaussian_features_to_attrs(feats)
 
-    gt_prune_enabled = bool(train_prune_with_gt_logits or gt_prune_with_gt_logits)
+    gt_prune_enabled = bool(gt_prune)
+    occ_head_prune_enabled = bool(occ_head_prune)
     if gt_prune_enabled and not HAS_MINKOWSKI:
         raise RuntimeError(
             "GT decoder pruning requires MinkowskiEngine sparse decoder coordinates "
@@ -121,16 +121,16 @@ def compute_batch_loss(
 
     occ_target_cache = {} if HAS_MINKOWSKI else None
 
-    decoder_prune_enabled = bool(decoder_prune or gt_prune_enabled)
+    pruning_enabled = bool(gt_prune_enabled or occ_head_prune_enabled)
 
     # Forward the full sparse batch through the model.
     pred_gaussians, occ_list, lfq_loss, indices = raw_model(
         gaussians,
         coords,
-        prune=decoder_prune_enabled,
         occupancy_threshold=occupancy_threshold,
         min_keep=prune_min_keep,
-        prune_with_encoder_targets=gt_prune_enabled,
+        gt_prune=gt_prune_enabled,
+        occ_head_prune=occ_head_prune_enabled,
         occ_target_cache=occ_target_cache,
     )
     pred_coords = pred_gaussians.pop("_coords", None)
@@ -142,7 +142,7 @@ def compute_batch_loss(
             coords,
             pred_coords,
             occ_list,
-            decoder_prune_enabled,
+            pruning_enabled,
             log_prefix,
         )
     if (
@@ -180,8 +180,8 @@ def compute_batch_loss(
             if cached_targets is None:
                 raise RuntimeError(
                     "Decoder did not cache sparse occupancy targets for "
-                    f"stage {stage_idx}. L_occ requires encoder target "
-                    "coordinate_map_keys from the current model forward."
+                    f"stage {stage_idx}. L_occ requires the raw input "
+                    "coordinate_map_key from the current model forward."
                 )
             occ_logits, targets, stride = cached_targets
             if targets.numel() != occ_logits.numel():

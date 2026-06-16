@@ -109,11 +109,11 @@ class GaussianAutoencoder(nn.Module):
         self,
         gaussians: Dict[str, torch.Tensor],
         voxel_coords: torch.Tensor,
-        prune: bool = False,
         occupancy_threshold: float = 0.5,
         min_keep: int = 1,
         prune_mask_fn=None,
-        prune_with_encoder_targets: bool = False,
+        gt_prune: bool = False,
+        occ_head_prune: bool = False,
         occ_target_cache: Optional[dict] = None,
     ) -> Tuple[Dict[str, torch.Tensor], List, torch.Tensor, torch.Tensor]:
         """
@@ -122,13 +122,13 @@ class GaussianAutoencoder(nn.Module):
         Args:
             gaussians: dict of Gaussian attribute tensors, each (N, attr_dim)
             voxel_coords: (N, 3) integer voxel coordinates (relative to chunk)
-            prune: enable decoder occupancy pruning for evaluation/generation-like paths
             occupancy_threshold: occupancy probability threshold used when pruning
             min_keep: minimum voxels to keep at each decoder pruning stage
             prune_mask_fn: optional callable returning an external keep mask per
                 decoder stage; when omitted, pruning uses occ-head logits
-            prune_with_encoder_targets: use encoder coordinate_map_key targets
-                for decoder pruning instead of occ-head logits
+            gt_prune: use raw input sparse coordinates, strided to each decoder
+                stage, as a decoder keep mask
+            occ_head_prune: use occupancy-head predictions as a decoder keep mask
             occ_target_cache: optional dict populated with per-stage
                 (occ_logits, targets, stride) tuples for L_occ
         Returns:
@@ -143,12 +143,15 @@ class GaussianAutoencoder(nn.Module):
         # Step 2: sparse 3D CNN encoder
         if HAS_MINKOWSKI:
             sparse_in = self._make_sparse_tensor(voxel_features, voxel_coords)
+            target_key = sparse_in.coordinate_map_key
             z_sparse = self.encoder(sparse_in)
             z = z_sparse.F  # (N_latent, num_bits)
-            encoder_target_keys = None
-            if prune_with_encoder_targets or occ_target_cache is not None:
-                encoder_target_keys = dict(self.encoder.encoder_target_keys)
         else:
+            if gt_prune:
+                raise RuntimeError(
+                    "GT decoder pruning requires MinkowskiEngine sparse "
+                    "coordinate_map_keys."
+                )
             # Dense fallback: place features in a (1, C, X, Y, Z) grid
             max_coord = voxel_coords.max(0).values  # (3,)
             gx = int(max_coord[0].item()) + 1
@@ -178,12 +181,12 @@ class GaussianAutoencoder(nn.Module):
             )
             decoded_sparse, occ_list = self.decoder(
                 z_q_sparse,
-                prune=prune,
                 occupancy_threshold=occupancy_threshold,
                 min_keep=min_keep,
                 prune_mask_fn=prune_mask_fn,
-                encoder_target_keys=encoder_target_keys,
-                prune_with_encoder_targets=prune_with_encoder_targets,
+                target_key=target_key,
+                gt_prune=gt_prune,
+                occ_head_prune=occ_head_prune,
                 occ_target_cache=occ_target_cache,
             )
             decoded_feat = decoded_sparse.F  # (N_latent, in_ch)
@@ -196,15 +199,15 @@ class GaussianAutoencoder(nn.Module):
             z_q_grid[0, :, latent_vc[:, 0], latent_vc[:, 1], latent_vc[:, 2]] = z_q.T
             decoded_grid, occ_list = self.decoder(
                 z_q_grid,
-                prune=prune,
                 occupancy_threshold=occupancy_threshold,
                 min_keep=min_keep,
                 prune_mask_fn=prune_mask_fn,
+                occ_head_prune=occ_head_prune,
             )  # (1, in_ch, gx, gy, gz)
             decoded_feat = decoded_grid[0, :, vc[:, 0], vc[:, 1], vc[:, 2]].T  # (N, in_ch)
             batch_idx = torch.zeros(vc.shape[0], 1, dtype=torch.long, device=vc.device)
             decoded_coords = torch.cat([batch_idx, vc.long()], dim=1)
-            if prune and occ_list:
+            if occ_head_prune and occ_list:
                 if prune_mask_fn is None:
                     final_keep = self.decoder._dense_keep_mask(
                         occ_list[-1],

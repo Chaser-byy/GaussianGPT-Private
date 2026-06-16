@@ -31,13 +31,12 @@ loss:
   camera_jitter: 0.05
 
 validation:
-  prune: false
-  prune_with_gt_logits: true
+  gt_prune: true
+  occ_head_prune: false
   occ_threshold: 0.5
   prune_min_keep: 1
 
 training:
-  train_prune_with_gt_logits: true
   epochs: 100
   batch_size: 24
   lr: 1.0e-4

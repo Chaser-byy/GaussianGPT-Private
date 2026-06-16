@@ -8,36 +8,22 @@ model:
   use_generative_transpose: false
 
 data:
-  data_dir: "/home/chengtianle/GaussianGPT/data/overfit"
   cache_root: "/home/chengtianle/baiyiyang/GaussianGPT/data/cache/ASE_overfit"
   base_voxel_size: 0.025
   chunk_size: [256, 256, 256]
-
-  # Single-chunk overfit: repeat one fixed chunk throughout the epoch.
   fixed_chunk: true
   train_samples_per_epoch: 1000
   val_samples_per_epoch: 1
 
   min_occupancy_ae: 0.2
   max_candidate_chunks: 10
-  top_k_cameras: 12
   z_mode: "fixed_160"
-  preferred_coverage: 0.4          # Preferred ASE camera score threshold.
 
-  # Keep worker count at zero for single-chunk debugging so sampler state is stable.
   num_workers: 0
   val_num_workers: 0
   pin_memory: false
 
-  # If the overfit cache has multiple scenes, pin both splits to one scene id:
-  # train_scene_ids: ["00000"]
-  # val_scene_ids: ["00000"]
-  train_scene_ids: null
-  val_scene_ids: null
-
-  # Matching train/val seeds should pick the same chunk when fixed_chunk is true.
   seed: 42
-  val_seed: 42
 
 loss:
   lambda_rgb: 7.5
@@ -48,40 +34,19 @@ loss:
   n_images: 12
   render_size: 512
   perceptual_batch_size: 12
-  cache_fixed_gt_render: true
   vgg19_weights_path: "/home/chengtianle/baiyiyang/GaussianGPT/checkpoints/vgg19-dcbb9e9d.pth"
 
-  fov_deg: 60.0
-  radius_factor: 1.5
-  upper_hemisphere_only: false
-
-  # Disable jitter first for single-chunk overfit so render targets are fixed.
-  camera_jitter: 0.0
-
 validation:
-  prune: false
-  prune_with_gt_logits: false
-  occ_threshold: 0.5
-  prune_min_keep: 1
+  gt_prune: false
+  occ_head_prune: false
 
 camera_sampling:
-  mode: "scoring"           # "orbit" uses bbox orbit cameras; "scoring" samples real ASE cameras by chunk visibility.
-  dataset_type: "ase"       # "ase": frustum/chunk intersection projected hull area / full image area.
-                             # "3dfront": not implemented in this ASE path.
-  num_views: null           # scoring only; null falls back to loss.n_images
-  num_candidates: null      # Compatibility only; ASE scoring evaluates all real cameras.
-  temperature: 1.0
-  score_key: "frustum_image_coverage"  # Legacy alias "chunk_coverage" is accepted.
-  preferred_coverage: 0.4   # Prefer cameras with score >= this; fallback to any overlap, then uniform.
-  seed: null
-  log_every: 100
+  mode: "scoring"
 
 training:
-  train_prune_with_gt_logits: false  # Training decoder prune uses GT occupancy targets, not occ-head logits.
   epochs: 6000
   batch_size: 1
   lr: 1.0e-4
-  lr_min_ratio: 0.1
   save_every: 1500
   val_every_steps: 1000
 
@@ -89,18 +54,8 @@ diagnostics:
   color_check_every: 100
 
 debug:
-  norm: "bn"
-  color_activation: "clamp"
-
-  # Reuse the same chunk.
-  fixed_chunk: true
-
-  # Disable augmentation first to verify the model can fit a static target.
   no_augment: true
-
-  # Avoid random per-voxel survivor changes when several Gaussians share a voxel.
   voxel_dedup: "nearest"
-
   grad_clip: 1000.0
   occ_check_every: 100
   log_grad_norm_every: 20

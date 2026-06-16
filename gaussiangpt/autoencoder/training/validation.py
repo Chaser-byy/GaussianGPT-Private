@@ -11,7 +11,6 @@ from plyfile import PlyData, PlyElement
 from gaussiangpt.autoencoder.training.config import (
     camera_sampling_config,
     effective_render_view_count,
-    training_pruning_config,
     validation_pruning_config,
 )
 from gaussiangpt.autoencoder.training.gaussian_features import (
@@ -135,10 +134,10 @@ def save_validation_reconstruction(
     device: torch.device,
     ply_path: str,
     image_path: Optional[str] = None,
-    prune: bool = False,
+    gt_prune: bool = False,
+    occ_head_prune: bool = False,
     occupancy_threshold: float = 0.5,
     prune_min_keep: int = 1,
-    gt_prune_with_gt_logits: bool = False,
 ):
     """Save a validation reconstruction.
 
@@ -150,15 +149,14 @@ def save_validation_reconstruction(
     voxel_coords = sample["voxel_coords"].to(device)
     gaussians = {k: v.to(device) for k, v in sample.items()
                  if k in ("offset", "scale", "opacity", "rotation", "color", "sh")}
-    decoder_prune = bool(prune or gt_prune_with_gt_logits)
 
     pred_gaussians, _, _, _ = raw_model(
         gaussians,
         voxel_coords,
-        prune=decoder_prune,
+        gt_prune=gt_prune,
+        occ_head_prune=occ_head_prune,
         occupancy_threshold=occupancy_threshold,
         min_keep=prune_min_keep,
-        prune_with_encoder_targets=gt_prune_with_gt_logits,
     )
     pred_coords = pred_gaussians.pop("_coords", None)
     if pred_coords is not None:
@@ -266,23 +264,23 @@ def validate(
     total_loss = total_occ = total_lfq = 0.0
     total_rgb = total_perc = 0.0
     val_prune_cfg = validation_pruning_config(cfg)
-    train_prune_cfg = training_pruning_config(cfg)
-    val_prune = bool(val_prune_cfg["prune"])
-    train_gt_prune = bool(train_prune_cfg["train_prune_with_gt_logits"])
-    val_gt_prune = bool(val_prune_cfg["prune_with_gt_logits"] or train_gt_prune)
+    val_gt_prune = bool(val_prune_cfg["gt_prune"])
+    val_occ_head_prune = bool(val_prune_cfg["occ_head_prune"])
     val_occ_threshold = float(val_prune_cfg["occ_threshold"])
     val_prune_min_keep = int(val_prune_cfg["prune_min_keep"])
-    val_decoder_prune = bool(val_prune or val_gt_prune)
-    if val_gt_prune:
+    val_pruning_enabled = bool(val_gt_prune or val_occ_head_prune)
+    if val_gt_prune and val_occ_head_prune:
+        prediction_mode = "gt+occ-pruned"
+    elif val_gt_prune:
         prediction_mode = "gt-pruned"
-    elif val_prune:
+    elif val_occ_head_prune:
         prediction_mode = "occ-head-pruned"
     else:
         prediction_mode = "unpruned"
     print(
-        f"[validation pruning] enabled={val_decoder_prune} "
+        f"[validation pruning] enabled={val_pruning_enabled} "
         f"gt_prune={val_gt_prune} "
-        f"occ_head_prune={bool(val_prune and not val_gt_prune)} "
+        f"occ_head_prune={val_occ_head_prune} "
         f"occ_threshold={val_occ_threshold} prune_min_keep={val_prune_min_keep} "
         f"render_prediction={prediction_mode} saved_reconstruction={prediction_mode}"
     )
@@ -304,8 +302,8 @@ def validate(
                 perceptual=perceptual, rng=val_rng,
                 gt_render_cache=gt_render_cache,
                 global_step=global_step,
-                decoder_prune=val_prune,
-                gt_prune_with_gt_logits=val_gt_prune,
+                gt_prune=val_gt_prune,
+                occ_head_prune=val_occ_head_prune,
                 occupancy_threshold=val_occ_threshold,
                 prune_min_keep=val_prune_min_keep,
                 log_pruning=True,
@@ -320,10 +318,10 @@ def validate(
                 save_validation_reconstruction(
                     raw_model, ase_batch_sample_to_legacy_sample(batch, 0), cfg, device,
                     ply_path=recon_path, image_path=image_path,
-                    prune=val_prune,
+                    gt_prune=val_gt_prune,
+                    occ_head_prune=val_occ_head_prune,
                     occupancy_threshold=val_occ_threshold,
                     prune_min_keep=val_prune_min_keep,
-                    gt_prune_with_gt_logits=val_gt_prune,
                 )
                 saved_reconstruction = True
 
